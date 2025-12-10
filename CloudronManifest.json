@@ -1,0 +1,12 @@
+{
+  "id": "ai-bina-avm.orhan",
+  "title": "AI-Bina AVM API",
+  "author": "Orhan",
+  "description": "FastAPI service that serves CatBoost AVM predictions.",
+  "version": "1.0.0",
+  "healthCheckPath": "/predict",
+  "httpPort": 8000,
+  "manifestVersion": 2,
+  "addons": [],
+  "memoryLimit": 536870912
+}
