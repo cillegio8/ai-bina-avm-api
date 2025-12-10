@@ -6,6 +6,17 @@ import numpy as np
 
 app = FastAPI(title="AI-Bina AVM API")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # OR replace "*" with your frontend domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 # Load model once at startup
 model = CatBoostRegressor()
 model.load_model("ai_bina_catboost_avm.cbm")
