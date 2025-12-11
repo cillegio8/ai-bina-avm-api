@@ -6,6 +6,10 @@ import numpy as np
 
 app = FastAPI(title="AI-Bina AVM API")
 
+# your existing routes setup here (health, /predict, etc.)
+
+app.include_router(predict_explain_router)  # ⬅️ add this line
+
 from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
