@@ -1,63 +1,43 @@
-from fastapi import FastAPI
+# predict_explain.py
+
+from fastapi import APIRouter
 from pydantic import BaseModel
-import uvicorn
+from typing import Optional, Any, Dict, List
+
+import numpy as np
 import pandas as pd
+from catboost import CatBoostRegressor
+import shap
 
-app = FastAPI()
+# ---------- Router ----------
+router = APIRouter()
 
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # OR replace "*" with your frontend domain
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ---- Pydantic models ----
+# ---------- Pydantic models ----------
 
 class ListingFeatures(BaseModel):
-    # use same names as your model features
+    # Same logical fields as /predict, but simplified
+    location_name: str
+    city_name: str
     area_m2: float
     rooms: int
     floor: int | None = None
-    floors_total: int | None = None
-    property_type: str
-    microlocation: str | None = None
-    city: str
-    təmir: str | None = None
-    çıxarış: str | None = None
-    # include any tag_* features as optional 0/1 fields if you want clients to pass them
-    # or you compute them on backend from microlocation / extra_info
+    floor_count: int | None = None
+    leased: bool | None = None
+    has_mortgage: bool | None = None
+    has_bill_of_sale: bool | None = None
+    has_repair: bool | None = None
+    paid_daily: bool | None = None
+    is_business: bool | None = None
+    vipped: bool | None = None
+    featured: bool | None = None
+    photos_count: int | None = None
 
 
 class ExplanationResponse(BaseModel):
-    listing_id: str | None = None
-    predictions: dict
-    model_info: dict
-    key_attributes: dict
-    top_positive_contributors: list
-    top_negative_contributors: list
-    all_contributors: list
-
-
-# ---- Load model & SHAP explainer once at startup ----
-# model = CatBoostRegressor() ...
-# model.load_model("catboost_ai_bina_price_per_m2.cbm")
-# explainer = shap.TreeExplainer(model)
-
-@app.post("/predict_explain", response_model=ExplanationResponse)
-def predict_and_explain(features: ListingFeatures, listing_id: str | None = None):
-    # Convert Pydantic model to DataFrame in correct column order
-    data_dict = features.dict()
-    # ensure all model feature columns exist (fill missing tags with 0, etc.)
-    row_df = pd.DataFrame([data_dict])[X.columns]  # X.columns from training notebook
-
-    explanation = build_explanation_json(row_df, listing_id=listing_id)
-    return explanation
-
-# If running locally:
-# if __name__ == "__main__":
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
+    listing_id: Optional[str] = None
+    predictions: Dict[str, Any]
+    model_info: Dict[str, Any]
+    key_attributes: Dict[str, Any]
+    top_positive_contributors: List[Dict[str, Any]]
+    top_negative_contributors: List[Dict[str, Any]]
+    all_co_
