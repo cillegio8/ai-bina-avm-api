@@ -1,30 +1,42 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from catboost import CatBoostRegressor
 import pandas as pd
 import numpy as np
 
-app = FastAPI(title="AI-Bina AVM API")
+# --- IMPORT THE ROUTER (must be BEFORE app.include_router) ---
+from predict_explain import router as predict_explain_router
 
-# your existing routes setup here (health, /predict, etc.)
 
-app.include_router(predict_explain_router)  # ⬅️ add this line
+# ============================================================
+# FastAPI App
+# ============================================================
+app = FastAPI(
+    title="AI-Bina AVM API",
+    version="1.0.0"
+)
 
-from fastapi.middleware.cors import CORSMiddleware
-
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # OR replace "*" with your frontend domain
+    allow_origins=["*"],   # change in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# Load model once at startup
+# ============================================================
+# Load Model Once at Startup
+# ============================================================
 model = CatBoostRegressor()
 model.load_model("ai_bina_catboost_avm.cbm")
 
+
+# ============================================================
+# Schemas
+# ============================================================
 class PropertyFeatures(BaseModel):
     location_name: str
     city_name: str
@@ -42,45 +54,6 @@ class PropertyFeatures(BaseModel):
     featured: bool | None = None
     photos_count: int | None = None
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
 
-@app.post("/predict")
-def predict(p: PropertyFeatures):
-    # Provide defaults for None values
-    floor = p.floor or 0
-    floor_count = p.floor_count or 1
-    floor_ratio = floor / max(floor_count, 1)
+# ====================
 
-    row = {
-        "location_name": p.location_name,
-        "city_name": p.city_name,
-        "area_m2": p.area_m2,
-        "rooms": p.rooms,
-        "floor": floor,
-        "floor_count": floor_count,
-        "floor_ratio": floor_ratio,
-        "leased": int(p.leased) if p.leased is not None else 0,
-        "has_mortgage": int(p.has_mortgage) if p.has_mortgage is not None else 0,
-        "has_bill_of_sale": int(p.has_bill_of_sale) if p.has_bill_of_sale is not None else 0,
-        "has_repair": int(p.has_repair) if p.has_repair is not None else 0,
-        "paid_daily": int(p.paid_daily) if p.paid_daily is not None else 0,
-        "is_business": int(p.is_business) if p.is_business is not None else 0,
-        "vipped": int(p.vipped) if p.vipped is not None else 0,
-        "featured": int(p.featured) if p.featured is not None else 0,
-        "photos_count": p.photos_count or 0,
-    }
-
-    df = pd.DataFrame([row])
-
-    y_log = model.predict(df)[0]
-    price_per_m2 = float(np.exp(y_log))
-    total_price = price_per_m2 * p.area_m2
-
-    return {
-        "price_per_m2": price_per_m2,
-        "total_price": total_price,
-        "min_price": total_price * 0.9,
-        "max_price": total_price * 1.1,
-    }
