@@ -23,6 +23,19 @@ app.add_middleware(
 model = CatBoostRegressor()
 model.load_model("ai_bina_catboost_avm.cbm")
 
+# ---------------------------------------------------------
+# Optional SHAP (will not crash app if missing/broken)
+# ---------------------------------------------------------
+try:
+    import shap
+    explainer = shap.TreeExplainer(model)
+    SHAP_AVAILABLE = True
+    print("SHAP initialized")
+except Exception as e:
+    explainer = None
+    SHAP_AVAILABLE = False
+    print("SHAP disabled:", e)
+
 
 # =========================================================
 # Schemas
@@ -53,12 +66,37 @@ class ExplanationResponse(BaseModel):
     top_positive_contributors: List[Dict[str, Any]]
     top_negative_contributors: List[Dict[str, Any]]
     all_contributors: List[Dict[str, Any]]
+    group_contributions: Dict[str, float]
 
 
 # =========================================================
-# Helper – build model row (same logic as before)
+# Features used in model
+# =========================================================
+FEATURE_COLUMNS = [
+    "location_name",
+    "city_name",
+    "area_m2",
+    "rooms",
+    "floor",
+    "floor_count",
+    "floor_ratio",
+    "leased",
+    "has_mortgage",
+    "has_bill_of_sale",
+    "has_repair",
+    "paid_daily",
+    "is_business",
+    "vipped",
+    "featured",
+    "photos_count",
+]
+
+
+# =========================================================
+# Helpers
 # =========================================================
 def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
+    """Build a single-row DataFrame in the same format used for training."""
     floor = p.floor or 0
     floor_count = p.floor_count or 1
     floor_ratio = floor / max(floor_count, 1)
@@ -82,8 +120,152 @@ def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
         "photos_count": p.photos_count or 0,
     }
 
-    df = pd.DataFrame([row])
+    df = pd.DataFrame([row], columns=FEATURE_COLUMNS)
     return df
+
+
+def compute_shap_explanation(df: pd.DataFrame):
+    """
+    Returns:
+      base_price_per_m2,
+      contrib_sorted_df,
+      group_contributions_dict
+    or None if SHAP not available.
+    """
+    if not SHAP_AVAILABLE or explainer is None:
+        return None
+
+    try:
+        shap_vals = explainer.shap_values(df)[0]  # 1D array
+        base_value_log = float(explainer.expected_value)  # log(price_per_m2)
+        base_price_per_m2 = float(np.exp(base_value_log))
+
+        contrib_df = pd.DataFrame({
+            "feature": FEATURE_COLUMNS,
+            "value": df.iloc[0].values,
+            "shap_value": shap_vals,
+        })
+        contrib_df["abs_importance"] = contrib_df["shap_value"].abs()
+        contrib_sorted = contrib_df.sort_values("abs_importance", ascending=False)
+
+        # Grouping (Option C)
+        groups = {
+            "location": ["location_name", "city_name"],
+            "size": ["area_m2", "rooms"],
+            "building": ["floor", "floor_count", "floor_ratio"],
+            "status": [
+                "leased",
+                "has_mortgage",
+                "has_bill_of_sale",
+                "has_repair",
+                "paid_daily",
+                "is_business",
+            ],
+            "marketing": ["vipped", "featured", "photos_count"],
+        }
+
+        group_contribs: Dict[str, float] = {}
+        used_feats: List[str] = []
+
+        for g, feats in groups.items():
+            mask = contrib_df["feature"].isin(feats)
+            used_feats.extend(feats)
+            group_contribs[g] = float(contrib_df.loc[mask, "shap_value"].sum())
+
+        # "other" group if there are any remaining features
+        mask_other = ~contrib_df["feature"].isin(used_feats)
+        if mask_other.any():
+            group_contribs["other"] = float(
+                contrib_df.loc[mask_other, "shap_value"].sum()
+            )
+
+        return base_price_per_m2, contrib_sorted, group_contribs
+
+    except Exception as e:
+        # Never crash app because of SHAP
+        print("SHAP runtime error:", e)
+        return None
+
+
+def build_explanation_json(
+    p: PropertyFeatures, listing_id: Optional[str] = None
+) -> Dict[str, Any]:
+    df = make_feature_row(p)
+
+    # --- Prediction (same as /predict) ---
+    y_log = model.predict(df)[0]
+    price_per_m2 = float(np.exp(y_log))
+    total_price = price_per_m2 * p.area_m2
+    min_price = total_price * 0.9
+    max_price = total_price * 1.1
+
+    # Defaults (if SHAP not available)
+    base_price_per_m2 = price_per_m2
+    delta_price_per_m2 = 0.0
+    relative_position = "same"
+    top_pos: List[Dict[str, Any]] = []
+    top_neg: List[Dict[str, Any]] = []
+    all_contribs: List[Dict[str, Any]] = []
+    group_contribs: Dict[str, float] = {}
+
+    shap_result = compute_shap_explanation(df)
+    if shap_result is not None:
+        base_price_per_m2, contrib_sorted, group_contribs = shap_result
+        delta_price_per_m2 = price_per_m2 - base_price_per_m2
+        relative_position = "higher" if delta_price_per_m2 >= 0 else "lower"
+
+        def df_to_list(sub_df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for _, r in sub_df.head(limit).iterrows():
+                out.append(
+                    {
+                        "feature": r["feature"],
+                        "display_name": r["feature"],  # map to pretty labels in frontend
+                        "value": r["value"],
+                        "shap_value": float(r["shap_value"]),
+                        "abs_importance": float(r["abs_importance"]),
+                    }
+                )
+            return out
+
+        pos_df = contrib_sorted[contrib_sorted["shap_value"] > 0]
+        neg_df = contrib_sorted[contrib_sorted["shap_value"] < 0]
+
+        top_pos = df_to_list(pos_df, limit=6)
+        top_neg = df_to_list(neg_df, limit=6)
+        all_contribs = df_to_list(contrib_sorted, limit=30)
+
+    return {
+        "listing_id": listing_id,
+        "predictions": {
+            "currency": "AZN",
+            "price_per_m2": price_per_m2,
+            "total_price": total_price,
+            "min_price": min_price,
+            "max_price": max_price,
+            "area_m2": p.area_m2,
+        },
+        "model_info": {
+            "base_price_per_m2": base_price_per_m2,
+            "delta_price_per_m2": delta_price_per_m2,
+            "relative_position": relative_position,
+        },
+        "key_attributes": {
+            "location_name": p.location_name,
+            "city_name": p.city_name,
+            "rooms": p.rooms,
+            "floor": p.floor,
+            "floor_count": p.floor_count,
+            "leased": p.leased,
+            "has_repair": p.has_repair,
+            "has_bill_of_sale": p.has_bill_of_sale,
+            "has_mortgage": p.has_mortgage,
+        },
+        "top_positive_contributors": top_pos,
+        "top_negative_contributors": top_neg,
+        "all_contributors": all_contribs,
+        "group_contributions": group_contribs,
+    }
 
 
 # =========================================================
@@ -115,43 +297,9 @@ def predict_explain(
     listing_id: Optional[str] = None,
 ) -> ExplanationResponse:
     """
-    SAFE stub: wraps /predict result into the explanation JSON structure.
-    No SHAP, no extra imports – cannot crash from missing libs.
+    Full valuation explanation:
+    - prediction numbers
+    - feature-level SHAP contributions (A)
+    - grouped contributions (C) if SHAP is available.
     """
-    preds = predict(p)
-
-    # Neutral model_info for now
-    model_info = {
-        "base_price_per_m2": preds["price_per_m2"],
-        "delta_price_per_m2": 0.0,
-        "relative_position": "same",
-    }
-
-    key_attributes = {
-        "location_name": p.location_name,
-        "city_name": p.city_name,
-        "rooms": p.rooms,
-        "floor": p.floor,
-        "floor_count": p.floor_count,
-        "leased": p.leased,
-        "has_repair": p.has_repair,
-        "has_bill_of_sale": p.has_bill_of_sale,
-        "has_mortgage": p.has_mortgage,
-    }
-
-    return ExplanationResponse(
-        listing_id=listing_id,
-        predictions={
-            "currency": "AZN",
-            "price_per_m2": preds["price_per_m2"],
-            "total_price": preds["total_price"],
-            "min_price": preds["min_price"],
-            "max_price": preds["max_price"],
-            "area_m2": p.area_m2,
-        },
-        model_info=model_info,
-        key_attributes=key_attributes,
-        top_positive_contributors=[],
-        top_negative_contributors=[],
-        all_contributors=[],
-    )
+    return ExplanationResponse(**build_explanation_json(p, listing_id=listing_id))
