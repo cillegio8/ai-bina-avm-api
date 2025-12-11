@@ -6,7 +6,6 @@ from typing import Optional, Any, Dict, List
 from catboost import CatBoostRegressor
 import pandas as pd
 import numpy as np
-import shap
 
 app = FastAPI(title="AI-Bina AVM API")
 
@@ -19,12 +18,22 @@ app.add_middleware(
 )
 
 # =========================================================
-# Load model + SHAP explainer once
+# Load model once
 # =========================================================
 model = CatBoostRegressor()
 model.load_model("ai_bina_catboost_avm.cbm")
 
-explainer = shap.TreeExplainer(model)
+# Try to load SHAP, but don't crash if it fails
+try:
+    import shap
+    explainer = shap.TreeExplainer(model)
+    SHAP_AVAILABLE = True
+    print("SHAP initialized successfully")
+except Exception as e:  # covers ModuleNotFoundError and other issues
+    explainer = None
+    SHAP_AVAILABLE = False
+    print("SHAP disabled:", e)
+
 
 # Columns used for prediction (must match training)
 FEATURE_COLUMNS = [
@@ -122,37 +131,53 @@ def build_explanation_json(
     min_price = total_price * 0.9
     max_price = total_price * 1.1
 
-    # --- SHAP on this row ---
-    shap_vals = explainer.shap_values(df)[0]  # 1D array for 1 sample
-    base_value_log = float(explainer.expected_value)  # log(price_per_m2)
-    base_price_per_m2 = float(np.exp(base_value_log))
-    delta_price_per_m2 = price_per_m2 - base_price_per_m2
-    relative_position = "higher" if delta_price_per_m2 >= 0 else "lower"
+    # Default values if SHAP is not available
+    base_price_per_m2 = price_per_m2
+    delta_price_per_m2 = 0.0
+    relative_position = "same"
+    top_pos: List[Dict[str, Any]] = []
+    top_neg: List[Dict[str, Any]] = []
+    all_contribs: List[Dict[str, Any]] = []
 
-    contrib_df = pd.DataFrame({
-        "feature": FEATURE_COLUMNS,
-        "value": df.iloc[0].values,
-        "shap_value": shap_vals,
-    })
-    contrib_df["abs_importance"] = contrib_df["shap_value"].abs()
-    contrib_sorted = contrib_df.sort_values("abs_importance", ascending=False)
+    if SHAP_AVAILABLE and explainer is not None:
+        try:
+            shap_vals = explainer.shap_values(df)[0]  # 1D array
+            base_value_log = float(explainer.expected_value)  # log(price_per_m2)
+            base_price_per_m2 = float(np.exp(base_value_log))
+            delta_price_per_m2 = price_per_m2 - base_price_per_m2
+            relative_position = "higher" if delta_price_per_m2 >= 0 else "lower"
 
-    def df_to_list(sub_df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        for _, r in sub_df.head(limit).iterrows():
-            out.append(
-                {
-                    "feature": r["feature"],
-                    "display_name": r["feature"],  # frontend can map to human labels
-                    "value": r["value"],
-                    "shap_value_price_per_m2": float(r["shap_value"]),
-                    "abs_importance": float(r["abs_importance"]),
-                }
-            )
-        return out
+            contrib_df = pd.DataFrame({
+                "feature": FEATURE_COLUMNS,
+                "value": df.iloc[0].values,
+                "shap_value": shap_vals,
+            })
+            contrib_df["abs_importance"] = contrib_df["shap_value"].abs()
+            contrib_sorted = contrib_df.sort_values("abs_importance", ascending=False)
 
-    pos_df = contrib_sorted[contrib_sorted["shap_value"] > 0]
-    neg_df = contrib_sorted[contrib_sorted["shap_value"] < 0]
+            def df_to_list(sub_df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
+                out: List[Dict[str, Any]] = []
+                for _, r in sub_df.head(limit).iterrows():
+                    out.append(
+                        {
+                            "feature": r["feature"],
+                            "display_name": r["feature"],
+                            "value": r["value"],
+                            "shap_value_price_per_m2": float(r["shap_value"]),
+                            "abs_importance": float(r["abs_importance"]),
+                        }
+                    )
+                return out
+
+            pos_df = contrib_sorted[contrib_sorted["shap_value"] > 0]
+            neg_df = contrib_sorted[contrib_sorted["shap_value"] < 0]
+
+            top_pos = df_to_list(pos_df, limit=6)
+            top_neg = df_to_list(neg_df, limit=6)
+            all_contribs = df_to_list(contrib_sorted, limit=30)
+        except Exception as e:
+            # If SHAP fails at runtime, log and fall back to neutral explanation
+            print("SHAP runtime error, returning neutral explanation:", e)
 
     return {
         "listing_id": listing_id,
@@ -180,9 +205,9 @@ def build_explanation_json(
             "has_bill_of_sale": p.has_bill_of_sale,
             "has_mortgage": p.has_mortgage,
         },
-        "top_positive_contributors": df_to_list(pos_df, limit=6),
-        "top_negative_contributors": df_to_list(neg_df, limit=6),
-        "all_contributors": df_to_list(contrib_sorted, limit=30),
+        "top_positive_contributors": top_pos,
+        "top_negative_contributors": top_neg,
+        "all_contributors": all_contribs,
     }
 
 
