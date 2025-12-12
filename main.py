@@ -196,9 +196,31 @@ def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
         row["çıxarış"] = cixarish
 
     # set one-hot microlocation tag if the model uses tag_* columns
-    tag_col = f"tag_{sanitize_tag(p.microlocation)}"
-    if tag_col in row:
-        row[tag_col] = 1
+
+    # --- multi-hot microlocation tags ---
+tags: List[str] = []
+
+# new field takes priority
+if isinstance(p.microlocations, list) and len(p.microlocations) > 0:
+    tags = [t for t in p.microlocations if str(t).strip()]
+else:
+    # fallback to single microlocation
+    if str(p.microlocation).strip():
+        tags = [p.microlocation]
+
+# Keep a primary microlocation string if model expects it
+primary = tags[0] if tags else str(p.microlocation)
+
+if "microlocation" in row:
+    row["microlocation"] = str(primary)
+
+# Set multiple tag_* columns = 1
+for t in tags[:6]:  # safety cap (you said 3–4)
+    col = f"tag_{sanitize_tag(t)}"
+    if col in row:
+        row[col] = 1
+
+ 
 
     # build df in exact model order
     return pd.DataFrame([[row[f] for f in MODEL_FEATURES]], columns=MODEL_FEATURES)
