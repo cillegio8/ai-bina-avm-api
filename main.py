@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List, Tuple, Union
 import traceback
+import re
 
 from catboost import CatBoostRegressor, Pool
 import pandas as pd
@@ -27,28 +28,9 @@ app.add_middleware(
 model = CatBoostRegressor()
 model.load_model("ai_bina_catboost_avm.cbm")
 
-# =========================================================
-# Feature definitions (MUST MATCH TRAINING)
-# =========================================================
-FEATURE_NUMERIC = [
-    "area_m2",
-    "rooms",
-    "floor",
-    "floors_total",
-]
-
-FEATURE_CATEGORICAL = [
-    "property_type",
-    "microlocation",
-    "city",
-    "təmir",
-    "çıxarış",
-]
-
-FEATURE_COLUMNS = FEATURE_NUMERIC + FEATURE_CATEGORICAL
-
-# Safer than passing names (works reliably across CatBoost versions)
-CAT_FEATURE_INDICES = [FEATURE_COLUMNS.index(c) for c in FEATURE_CATEGORICAL]
+# ✅ Model-driven feature schema (source of truth)
+MODEL_FEATURES: List[str] = model.get_feature_names()
+MODEL_CAT_INDICES: List[int] = list(model.get_cat_feature_indices())
 
 # =========================================================
 # Normalizers (frontend-friendly -> model-friendly)
@@ -66,7 +48,6 @@ def normalize_cixarish(value: Boolish) -> str:
     """
     Normalize 'çıxarış' into CatBoost expected categories:
       - "var" | "yoxdur"
-    Accepts: Yes/No, true/false, 1/0, var/yoxdur, bəli/yox, etc.
     """
     v = _norm_str(value)
 
@@ -74,8 +55,6 @@ def normalize_cixarish(value: Boolish) -> str:
         return "var"
     if v in {"no", "false", "0", "yoxdur", "yox", "kupca yoxdur", "çıxarış yoxdur", "cixarish yoxdur", ""}:
         return "yoxdur"
-
-    # safe fallback
     return "yoxdur"
 
 
@@ -83,15 +62,12 @@ def normalize_temir(value: Boolish) -> str:
     """
     Normalize 'təmir' into CatBoost expected categories:
       - "təmirli" | "təmir tələb edir"
-    Accepts: Yes/No, true/false, 1/0, təmirli/təmirsiz/natəmirsiz, etc.
     """
     v = _norm_str(value)
 
-    # treated as renovated
     if v in {"yes", "true", "1", "təmirli", "temirli", "bəli", "beli", "əla təmirli", "yaxşı təmirli"}:
         return "təmirli"
 
-    # treated as needs repair / not renovated
     if v in {
         "no", "false", "0",
         "təmir tələb edir", "temir teleb edir",
@@ -102,15 +78,14 @@ def normalize_temir(value: Boolish) -> str:
     }:
         return "təmir tələb edir"
 
-    # if unknown, default to conservative bucket
     return "təmir tələb edir"
 
 
 def normalize_property_type(value: Optional[str]) -> str:
     """
     Normalize property_type into CatBoost expected categories.
-    Model known: new_apartment / old_apartment / house
-    MVP: keep only new_apartment / old_apartment (house -> old_apartment)
+    Known: new_apartment / old_apartment / house
+    MVP: map house -> old_apartment
     """
     v = _norm_str(value)
 
@@ -121,15 +96,35 @@ def normalize_property_type(value: Optional[str]) -> str:
         return "old_apartment"
 
     if v in {"house", "həyət evi", "heyet evi", "bağ evi", "bag evi", "villa"}:
-        # MVP does not use house; map to old_apartment for stability
         return "old_apartment"
 
-    # fallback default (MVP)
     return "new_apartment"
 
 
+def sanitize_tag(tag: str) -> str:
+    """
+    Must match training sanitizer that produced columns like:
+      tag_yasamal_r
+    """
+    tag = str(tag).lower().strip()
+    tag = re.sub(r"\W+", "_", tag)
+    tag = tag.strip("_")
+    return tag or "unknown_tag"
+
+
+def is_cat_feature_name(col: str) -> bool:
+    """
+    Determine if a column is categorical based on model.get_cat_feature_indices()
+    """
+    try:
+        idx = MODEL_FEATURES.index(col)
+        return idx in MODEL_CAT_INDICES
+    except ValueError:
+        return False
+
+
 # =========================================================
-# Schemas
+# Schemas (request payload)
 # =========================================================
 class PropertyFeatures(BaseModel):
     area_m2: float = Field(..., gt=0)
@@ -159,28 +154,56 @@ class ExplanationResponse(BaseModel):
 # Helpers
 # =========================================================
 def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
-    # normalize categorical fields to what CatBoost expects
+    """
+    Build a DataFrame that matches the deployed model schema EXACTLY:
+      - same columns
+      - same order
+    Also supports "tag_*" one-hot columns.
+    """
+
+    # normalized fields
     pt = normalize_property_type(p.property_type)
     temir = normalize_temir(p.təmir)
     cixarish = normalize_cixarish(p.çıxarış)
 
-    row = {
-        "area_m2": float(p.area_m2),
-        "rooms": int(p.rooms),
-        "floor": int(p.floor) if p.floor is not None else 0,
-        "floors_total": int(p.floors_total) if p.floors_total is not None else 0,
+    # init row with correct defaults per feature type
+    row: Dict[str, Any] = {}
+    for f in MODEL_FEATURES:
+        row[f] = "" if is_cat_feature_name(f) else 0
 
-        "property_type": pt,
-        "microlocation": str(p.microlocation),
-        "city": str(p.city),
-        "təmir": temir,
-        "çıxarış": cixarish,
-    }
-    return pd.DataFrame([row], columns=FEATURE_COLUMNS)
+    # fill numeric if model expects them
+    if "area_m2" in row:
+        row["area_m2"] = float(p.area_m2)
+    if "rooms" in row:
+        row["rooms"] = int(p.rooms)
+    if "floor" in row:
+        row["floor"] = int(p.floor) if p.floor is not None else 0
+    if "floors_total" in row:
+        row["floors_total"] = int(p.floors_total) if p.floors_total is not None else 0
+
+    # fill categorical/base if model expects them
+    if "property_type" in row:
+        row["property_type"] = pt
+    if "microlocation" in row:
+        row["microlocation"] = str(p.microlocation)
+    if "city" in row:
+        row["city"] = str(p.city)
+    if "təmir" in row:
+        row["təmir"] = temir
+    if "çıxarış" in row:
+        row["çıxarış"] = cixarish
+
+    # set one-hot microlocation tag if the model uses tag_* columns
+    tag_col = f"tag_{sanitize_tag(p.microlocation)}"
+    if tag_col in row:
+        row[tag_col] = 1
+
+    # build df in exact model order
+    return pd.DataFrame([[row[f] for f in MODEL_FEATURES]], columns=MODEL_FEATURES)
 
 
 def predict_price_per_m2(df: pd.DataFrame) -> float:
-    pool = Pool(df, cat_features=CAT_FEATURE_INDICES)
+    pool = Pool(df, cat_features=MODEL_CAT_INDICES)
     return float(model.predict(pool)[0])
 
 
@@ -190,16 +213,16 @@ def catboost_contributions(df: pd.DataFrame) -> Tuple[float, pd.DataFrame]:
       base_value: model expected value (bias)
       contrib_df: per-feature contributions (same units as target: AZN/m²)
     """
-    pool = Pool(df, cat_features=CAT_FEATURE_INDICES)
+    pool = Pool(df, cat_features=MODEL_CAT_INDICES)
     shap_vals = model.get_feature_importance(pool, type="ShapValues")
 
-    row_vals = shap_vals[0]               # n_features + 1
-    contribs = row_vals[:-1]              # per-feature
-    base_value = float(row_vals[-1])      # expected value
+    row_vals = shap_vals[0]          # n_features + 1
+    contribs = row_vals[:-1]         # per-feature
+    base_value = float(row_vals[-1]) # expected value
 
     contrib_df = pd.DataFrame(
         {
-            "feature": FEATURE_COLUMNS,
+            "feature": MODEL_FEATURES,
             "value": df.iloc[0].values,
             "contrib": contribs,
         }
@@ -210,8 +233,16 @@ def catboost_contributions(df: pd.DataFrame) -> Tuple[float, pd.DataFrame]:
 
 
 def group_contributions(contrib_df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Works whether the model uses:
+      - categorical microlocation, OR
+      - tag_* one-hot columns
+    """
+    # detect tag_* columns present in model
+    tag_cols = [c for c in MODEL_FEATURES if c.startswith("tag_")]
+
     groups = {
-        "location": ["city", "microlocation"],
+        "location": ["city", "microlocation"] + tag_cols,
         "size": ["area_m2", "rooms"],
         "building": ["floor", "floors_total"],
         "legal": ["çıxarış"],
@@ -254,7 +285,7 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
     pos_df = contrib_df[contrib_df["contrib"] > 0]
     neg_df = contrib_df[contrib_df["contrib"] < 0]
 
-    # show normalized values in key_attributes (so frontend/debug sees what model actually used)
+    # show what the model actually used
     key_attrs = {
         "city": str(p.city),
         "microlocation": str(p.microlocation),
@@ -264,6 +295,7 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
         "floors_total": p.floors_total,
         "təmir": normalize_temir(p.təmir),
         "çıxarış": normalize_cixarish(p.çıxarış),
+        "model_tag_column_used": f"tag_{sanitize_tag(p.microlocation)}" if f"tag_{sanitize_tag(p.microlocation)}" in MODEL_FEATURES else None,
     }
 
     return {
@@ -280,7 +312,7 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
             "base_price_per_m2": base_value,
             "delta_price_per_m2": delta,
             "relative_position": relative_position,
-            "note": "CatBoost native SHAP values. Target = unit_price (AZN/m²).",
+            "note": "CatBoost native SHAP values. Target = unit_price (AZN/m²). Schema taken from model.get_feature_names().",
         },
         "key_attributes": key_attrs,
         "top_positive_contributors": df_to_list(pos_df, 6),
@@ -295,7 +327,12 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
 # =========================================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": "catboost-avm-unit-price"}
+    return {
+        "status": "ok",
+        "model": "catboost-avm-unit-price",
+        "n_features": len(MODEL_FEATURES),
+        "n_cat_features": len(MODEL_CAT_INDICES),
+    }
 
 
 @app.post("/predict")
