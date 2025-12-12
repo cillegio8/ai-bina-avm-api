@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 import traceback
 
 from catboost import CatBoostRegressor, Pool
@@ -51,6 +51,84 @@ FEATURE_COLUMNS = FEATURE_NUMERIC + FEATURE_CATEGORICAL
 CAT_FEATURE_INDICES = [FEATURE_COLUMNS.index(c) for c in FEATURE_CATEGORICAL]
 
 # =========================================================
+# Normalizers (frontend-friendly -> model-friendly)
+# =========================================================
+Boolish = Union[str, bool, int, None]
+
+
+def _norm_str(x: Boolish) -> str:
+    if x is None:
+        return ""
+    return str(x).strip().lower()
+
+
+def normalize_cixarish(value: Boolish) -> str:
+    """
+    Normalize 'çıxarış' into CatBoost expected categories:
+      - "var" | "yoxdur"
+    Accepts: Yes/No, true/false, 1/0, var/yoxdur, bəli/yox, etc.
+    """
+    v = _norm_str(value)
+
+    if v in {"yes", "true", "1", "var", "bəli", "beli", "kupca var", "çıxarış var", "cixarish var"}:
+        return "var"
+    if v in {"no", "false", "0", "yoxdur", "yox", "kupca yoxdur", "çıxarış yoxdur", "cixarish yoxdur", ""}:
+        return "yoxdur"
+
+    # safe fallback
+    return "yoxdur"
+
+
+def normalize_temir(value: Boolish) -> str:
+    """
+    Normalize 'təmir' into CatBoost expected categories:
+      - "təmirli" | "təmir tələb edir"
+    Accepts: Yes/No, true/false, 1/0, təmirli/təmirsiz/natəmirsiz, etc.
+    """
+    v = _norm_str(value)
+
+    # treated as renovated
+    if v in {"yes", "true", "1", "təmirli", "temirli", "bəli", "beli", "əla təmirli", "yaxşı təmirli"}:
+        return "təmirli"
+
+    # treated as needs repair / not renovated
+    if v in {
+        "no", "false", "0",
+        "təmir tələb edir", "temir teleb edir",
+        "təmirsiz", "temirsiz",
+        "natəmirsiz", "natemirsiz",
+        "yarımçıq təmir", "temirsizdir",
+        ""
+    }:
+        return "təmir tələb edir"
+
+    # if unknown, default to conservative bucket
+    return "təmir tələb edir"
+
+
+def normalize_property_type(value: Optional[str]) -> str:
+    """
+    Normalize property_type into CatBoost expected categories.
+    Model known: new_apartment / old_apartment / house
+    MVP: keep only new_apartment / old_apartment (house -> old_apartment)
+    """
+    v = _norm_str(value)
+
+    if v in {"new_apartment", "new", "yeni", "yeni tikili", "yeni tikili mənzil", "yeni tikili menzil"}:
+        return "new_apartment"
+
+    if v in {"old_apartment", "old", "köhnə", "kohne", "köhnə tikili", "kohne tikili", "köhnə tikili mənzil"}:
+        return "old_apartment"
+
+    if v in {"house", "həyət evi", "heyet evi", "bağ evi", "bag evi", "villa"}:
+        # MVP does not use house; map to old_apartment for stability
+        return "old_apartment"
+
+    # fallback default (MVP)
+    return "new_apartment"
+
+
+# =========================================================
 # Schemas
 # =========================================================
 class PropertyFeatures(BaseModel):
@@ -62,8 +140,8 @@ class PropertyFeatures(BaseModel):
     property_type: str
     microlocation: str
     city: str
-    təmir: str
-    çıxarış: str
+    təmir: Boolish
+    çıxarış: Boolish
 
 
 class ExplanationResponse(BaseModel):
@@ -81,17 +159,22 @@ class ExplanationResponse(BaseModel):
 # Helpers
 # =========================================================
 def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
+    # normalize categorical fields to what CatBoost expects
+    pt = normalize_property_type(p.property_type)
+    temir = normalize_temir(p.təmir)
+    cixarish = normalize_cixarish(p.çıxarış)
+
     row = {
         "area_m2": float(p.area_m2),
         "rooms": int(p.rooms),
         "floor": int(p.floor) if p.floor is not None else 0,
         "floors_total": int(p.floors_total) if p.floors_total is not None else 0,
 
-        "property_type": str(p.property_type),
+        "property_type": pt,
         "microlocation": str(p.microlocation),
         "city": str(p.city),
-        "təmir": str(p.təmir),
-        "çıxarış": str(p.çıxarış),
+        "təmir": temir,
+        "çıxarış": cixarish,
     }
     return pd.DataFrame([row], columns=FEATURE_COLUMNS)
 
@@ -146,7 +229,7 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
     df = make_feature_row(p)
 
     price_per_m2 = predict_price_per_m2(df)
-    total_price = price_per_m2 * p.area_m2
+    total_price = price_per_m2 * float(p.area_m2)
 
     base_value, contrib_df = catboost_contributions(df)
 
@@ -171,6 +254,18 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
     pos_df = contrib_df[contrib_df["contrib"] > 0]
     neg_df = contrib_df[contrib_df["contrib"] < 0]
 
+    # show normalized values in key_attributes (so frontend/debug sees what model actually used)
+    key_attrs = {
+        "city": str(p.city),
+        "microlocation": str(p.microlocation),
+        "property_type": normalize_property_type(p.property_type),
+        "rooms": int(p.rooms),
+        "floor": p.floor,
+        "floors_total": p.floors_total,
+        "təmir": normalize_temir(p.təmir),
+        "çıxarış": normalize_cixarish(p.çıxarış),
+    }
+
     return {
         "listing_id": listing_id,
         "predictions": {
@@ -179,7 +274,7 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
             "total_price": total_price,
             "min_price": total_price * 0.9,
             "max_price": total_price * 1.1,
-            "area_m2": p.area_m2,
+            "area_m2": float(p.area_m2),
         },
         "model_info": {
             "base_price_per_m2": base_value,
@@ -187,16 +282,7 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
             "relative_position": relative_position,
             "note": "CatBoost native SHAP values. Target = unit_price (AZN/m²).",
         },
-        "key_attributes": {
-            "city": p.city,
-            "microlocation": p.microlocation,
-            "property_type": p.property_type,
-            "rooms": p.rooms,
-            "floor": p.floor,
-            "floors_total": p.floors_total,
-            "təmir": p.təmir,
-            "çıxarış": p.çıxarış,
-        },
+        "key_attributes": key_attrs,
         "top_positive_contributors": df_to_list(pos_df, 6),
         "top_negative_contributors": df_to_list(neg_df, 6),
         "all_contributors": df_to_list(contrib_df, 30),
@@ -217,7 +303,7 @@ def predict(p: PropertyFeatures):
     try:
         df = make_feature_row(p)
         price_per_m2 = predict_price_per_m2(df)
-        total_price = price_per_m2 * p.area_m2
+        total_price = price_per_m2 * float(p.area_m2)
 
         return {
             "price_per_m2": price_per_m2,
