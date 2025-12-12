@@ -1,12 +1,15 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 from catboost import CatBoostRegressor, Pool
 import pandas as pd
 import numpy as np
 
+# =========================================================
+# App
+# =========================================================
 app = FastAPI(title="AI-Bina AVM API")
 
 app.add_middleware(
@@ -18,16 +21,29 @@ app.add_middleware(
 )
 
 # =========================================================
-# Load model once at startup
+# Load model (ONCE)
 # =========================================================
 model = CatBoostRegressor()
 model.load_model("ai_bina_catboost_avm.cbm")
 
 # =========================================================
-# Features used in model (MUST match training)
+# Feature definitions (MUST MATCH TRAINING)
 # =========================================================
-FEATURE_NUMERIC = ["area_m2", "rooms", "floor", "floors_total"]
-FEATURE_CATEGORICAL = ["property_type", "microlocation", "city", "təmir", "çıxarış"]
+FEATURE_NUMERIC = [
+    "area_m2",
+    "rooms",
+    "floor",
+    "floors_total",
+]
+
+FEATURE_CATEGORICAL = [
+    "property_type",
+    "microlocation",
+    "city",
+    "təmir",
+    "çıxarış",
+]
+
 FEATURE_COLUMNS = FEATURE_NUMERIC + FEATURE_CATEGORICAL
 CAT_FEATURES = FEATURE_CATEGORICAL  # pass names to Pool
 
@@ -62,23 +78,156 @@ class ExplanationResponse(BaseModel):
 # Helpers
 # =========================================================
 def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
-    row: Dict[str, Any] = {
-        # numeric
+    row = {
         "area_m2": float(p.area_m2),
         "rooms": int(p.rooms),
         "floor": int(p.floor) if p.floor is not None else 0,
         "floors_total": int(p.floors_total) if p.floors_total is not None else 0,
 
-        # categorical (strings)
-        "property_type": str(p.property_type or ""),
-        "microlocation": str(p.microlocation or ""),
-        "city": str(p.city or ""),
-        "təmir": str(p.təmir or ""),
-        "çıxarış": str(p.çıxarış or ""),
+        "property_type": str(p.property_type),
+        "microlocation": str(p.microlocation),
+        "city": str(p.city),
+        "təmir": str(p.təmir),
+        "çıxarış": str(p.çıxarış),
     }
-
     return pd.DataFrame([row], columns=FEATURE_COLUMNS)
 
 
-def catboost_contributions(df: pd.DataFrame) -> tuple[float, pd.DataFrame]:
+def catboost_contributions(df: pd.DataFrame) -> Tuple[float, pd.DataFrame]:
     """
+    Returns:
+      base_value: model bias (expected value)
+      contrib_df: per-feature contributions (same units as target)
+    """
+    pool = Pool(df, cat_features=CAT_FEATURES)
+    shap_vals = model.get_feature_importance(pool, type="ShapValues")
+
+    row_vals = shap_vals[0]
+    contribs = row_vals[:-1]
+    base_value = float(row_vals[-1])
+
+    contrib_df = pd.DataFrame(
+        {
+            "feature": FEATURE_COLUMNS,
+            "value": df.iloc[0].values,
+            "contrib": contribs,
+        }
+    )
+    contrib_df["abs_importance"] = np.abs(contrib_df["contrib"])
+    contrib_df = contrib_df.sort_values("abs_importance", ascending=False)
+
+    return base_value, contrib_df
+
+
+def group_contributions(contrib_df: pd.DataFrame) -> Dict[str, float]:
+    groups = {
+        "location": ["city", "microlocation"],
+        "size": ["area_m2", "rooms"],
+        "building": ["floor", "floors_total"],
+        "legal": ["çıxarış"],
+        "condition": ["təmir"],
+        "type": ["property_type"],
+    }
+
+    out: Dict[str, float] = {}
+    for group, feats in groups.items():
+        out[group] = float(
+            contrib_df.loc[contrib_df["feature"].isin(feats), "contrib"].sum()
+        )
+    return out
+
+
+def build_explanation_json(
+    p: PropertyFeatures, listing_id: Optional[str] = None
+) -> Dict[str, Any]:
+    df = make_feature_row(p)
+
+    price_per_m2 = float(model.predict(df)[0])
+    total_price = price_per_m2 * p.area_m2
+
+    base_value, contrib_df = catboost_contributions(df)
+
+    delta = price_per_m2 - base_value
+    relative_position = "higher" if delta > 0 else "lower" if delta < 0 else "same"
+
+    def df_to_list(df_sub: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
+        out = []
+        for _, r in df_sub.head(limit).iterrows():
+            out.append(
+                {
+                    "feature": r["feature"],
+                    "display_name": r["feature"],
+                    "value": r["value"],
+                    "contrib": float(r["contrib"]),
+                    "contrib_azn_per_m2": float(r["contrib"]),
+                    "abs_importance": float(r["abs_importance"]),
+                }
+            )
+        return out
+
+    pos_df = contrib_df[contrib_df["contrib"] > 0]
+    neg_df = contrib_df[contrib_df["contrib"] < 0]
+
+    return {
+        "listing_id": listing_id,
+        "predictions": {
+            "currency": "AZN",
+            "price_per_m2": price_per_m2,
+            "total_price": total_price,
+            "min_price": total_price * 0.9,
+            "max_price": total_price * 1.1,
+            "area_m2": p.area_m2,
+        },
+        "model_info": {
+            "base_price_per_m2": base_value,
+            "delta_price_per_m2": delta,
+            "relative_position": relative_position,
+            "note": "CatBoost native SHAP values. Target = unit_price (AZN/m²).",
+        },
+        "key_attributes": {
+            "city": p.city,
+            "microlocation": p.microlocation,
+            "property_type": p.property_type,
+            "rooms": p.rooms,
+            "floor": p.floor,
+            "floors_total": p.floors_total,
+            "təmir": p.təmir,
+            "çıxarış": p.çıxarış,
+        },
+        "top_positive_contributors": df_to_list(pos_df, 6),
+        "top_negative_contributors": df_to_list(neg_df, 6),
+        "all_contributors": df_to_list(contrib_df, 30),
+        "group_contributions": group_contributions(contrib_df),
+    }
+
+
+# =========================================================
+# Endpoints
+# =========================================================
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": "catboost-avm-unit-price"}
+
+
+@app.post("/predict")
+def predict(p: PropertyFeatures):
+    df = make_feature_row(p)
+    price_per_m2 = float(model.predict(df)[0])
+    total_price = price_per_m2 * p.area_m2
+
+    return {
+        "price_per_m2": price_per_m2,
+        "total_price": total_price,
+        "min_price": total_price * 0.9,
+        "max_price": total_price * 1.1,
+    }
+
+
+@app.post("/predict_explain", response_model=ExplanationResponse)
+def predict_explain(
+    p: PropertyFeatures,
+    listing_id: Optional[str] = Query(default=None),
+):
+    return ExplanationResponse(
+        **build_explanation_json(p, listing_id=listing_id)
+    )
