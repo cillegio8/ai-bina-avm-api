@@ -1,10 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.requests import Request
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List, Tuple, Union
 import traceback
 import re
 import uuid
+import json
 
 from catboost import CatBoostRegressor, Pool
 import pandas as pd
@@ -15,40 +18,72 @@ import numpy as np
 # =========================================================
 app = FastAPI(title="AI-Bina AVM API (MVP)")
 
-from fastapi.responses import JSONResponse
-from fastapi.requests import Request
-import traceback
+# =========================================================
+# JSON safety (FIX for numpy/pandas types)
+# =========================================================
+def to_py(v: Any) -> Any:
+    """Convert numpy/pandas scalars to native JSON-safe Python types."""
+    # numpy scalars
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return float(v)
+    if isinstance(v, (np.bool_,)):
+        return bool(v)
+
+    # pandas NA
+    if v is pd.NA:
+        return None
+
+    # numpy arrays
+    if isinstance(v, np.ndarray):
+        return [to_py(x) for x in v.tolist()]
+
+    return v
+
+
+def safe_json(obj: Any) -> Any:
+    """
+    Recursively convert dict/list contents to JSON-safe types.
+    Ensures FastAPI encoder never sees numpy/pandas scalars.
+    """
+    if isinstance(obj, dict):
+        return {str(k): safe_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [safe_json(v) for v in obj]
+    return to_py(obj)
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     tb = traceback.format_exc()
     print("❌ UNHANDLED ERROR:", tb)
+    # keep trace for now; remove later
     return JSONResponse(
         status_code=500,
-        content={
-            "error": str(exc),
-            "path": str(request.url.path),
-            "trace": tb,   # remove later
-        },
+        content=safe_json(
+            {
+                "error": str(exc),
+                "path": str(request.url.path),
+                "trace": tb,
+            }
+        ),
     )
 
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # MVP
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 
 # =========================================================
 # Load model (ONCE)
 # =========================================================
 model = CatBoostRegressor()
 model.load_model("ai_bina_catboost_avm.cbm")
-
 
 # =========================================================
 # Model metadata (version-safe)
@@ -84,7 +119,6 @@ if not MODEL_FEATURES:
         "Could not read feature names from CatBoost model. "
         "Fix by upgrading catboost or hardcoding MODEL_FEATURES."
     )
-
 
 # =========================================================
 # Normalizers
@@ -130,8 +164,7 @@ def normalize_property_type(value: Optional[str]) -> str:
     if v in {"old_apartment", "old", "köhnə", "kohne", "köhnə tikili", "kohne tikili", "köhnə tikili mənzil"}:
         return "old_apartment"
     if v in {"house", "həyət evi", "heyet evi", "bağ evi", "bag evi", "villa"}:
-        # MVP mapping
-        return "old_apartment"
+        return "old_apartment"  # MVP mapping
     return "new_apartment"
 
 
@@ -156,7 +189,6 @@ def extract_microlocation_tags(
             parts = re.split(r"[\*\|;,]+", s)
             tags = [p.strip() for p in parts if p.strip()]
 
-    # de-duplicate keep order
     seen = set()
     uniq: List[str] = []
     for t in tags:
@@ -166,7 +198,6 @@ def extract_microlocation_tags(
             uniq.append(t)
 
     return uniq[:max_tags]
-
 
 # =========================================================
 # Schemas
@@ -181,34 +212,25 @@ class PropertyFeatures(BaseModel):
     city: str
 
     microlocation: str
-    microlocations: Optional[List[str]] = None  # allow multiple tags
+    microlocations: Optional[List[str]] = None
 
     təmir: Boolish
     çıxarış: Boolish
 
-
 # =========================================================
-# Core helpers (single source of truth)
+# Core helpers
 # =========================================================
 def _cat_indices_for_df(df: pd.DataFrame) -> List[int]:
-    # Prefer model-provided indices
     if MODEL_CAT_INDICES:
         return MODEL_CAT_INDICES
-    # Fallback infer
     return [i for i, c in enumerate(df.columns) if df[c].dtype == "object"]
 
 
 def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
-    """
-    Build a 1-row DataFrame matching MODEL_FEATURES exactly (columns + order).
-    Handles multi-microlocation tag_ columns if model has them.
-    Ensures no NaN in categorical columns.
-    """
     pt = normalize_property_type(p.property_type)
     temir = normalize_temir(p.təmir)
     cixarish = normalize_cixarish(p.çıxarış)
 
-    # default row
     row: Dict[str, Any] = {f: 0 for f in MODEL_FEATURES}
 
     # numeric
@@ -245,13 +267,13 @@ def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
 
     df = pd.DataFrame([[row[f] for f in MODEL_FEATURES]], columns=MODEL_FEATURES)
 
-    # IMPORTANT: make categorical columns safe (no NaN, force string)
+    # make categorical safe
     cat_idx = _cat_indices_for_df(df)
     for i in cat_idx:
         c = df.columns[i]
         df[c] = df[c].fillna("unknown").astype(str)
 
-    # numeric NaN safety (just in case)
+    # numeric NaN safe
     for c in df.columns:
         if c not in df.columns[cat_idx]:
             if pd.api.types.is_numeric_dtype(df[c]):
@@ -266,9 +288,6 @@ def _predict_unit_price(df: pd.DataFrame) -> float:
 
 
 def _shap_contributions(df: pd.DataFrame) -> Tuple[float, pd.DataFrame]:
-    """
-    Returns base_value and contributions DF sorted by abs contribution.
-    """
     pool = Pool(df, cat_features=_cat_indices_for_df(df))
     shap_vals = model.get_feature_importance(pool, type="ShapValues")
 
@@ -296,7 +315,8 @@ def _group_contributions(contrib_df: pd.DataFrame) -> Dict[str, float]:
     }
     out: Dict[str, float] = {}
     for g, feats in groups.items():
-        out[g] = float(contrib_df.loc[contrib_df["feature"].isin(feats), "contrib"].sum())
+        s = contrib_df.loc[contrib_df["feature"].isin(feats), "contrib"].sum()
+        out[g] = float(s)  # ensure python float
     return out
 
 
@@ -304,9 +324,9 @@ def _to_items(df_sub: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     for _, r in df_sub.head(limit).iterrows():
         items.append({
-            "feature": r["feature"],
-            "value": r["value"],
-            "contrib_azn_per_m2": float(r["contrib"]),
+            "feature": str(to_py(r["feature"])),
+            "value": safe_json(to_py(r["value"])),
+            "contrib_azn_per_m2": float(to_py(r["contrib"])),
         })
     return items
 
@@ -314,8 +334,8 @@ def _to_items(df_sub: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
 def build_explain_response(p: PropertyFeatures, listing_id: Optional[str] = None) -> Dict[str, Any]:
     df = make_feature_row(p)
 
-    price_per_m2 = _predict_unit_price(df)
-    total_price = price_per_m2 * float(p.area_m2)
+    price_per_m2 = float(_predict_unit_price(df))
+    total_price = float(price_per_m2 * float(p.area_m2))
 
     base_value, contrib_df = _shap_contributions(df)
 
@@ -323,21 +343,27 @@ def build_explain_response(p: PropertyFeatures, listing_id: Optional[str] = None
     neg_df = contrib_df[contrib_df["contrib"] < 0]
 
     tags = extract_microlocation_tags(p.microlocation, p.microlocations, max_tags=6)
-    used_tag_cols = [f"tag_{sanitize_tag(t)}" for t in tags if f"tag_{sanitize_tag(t)}" in MODEL_FEATURES]
+    tags = [str(t) for t in tags]
 
-    return {
+    used_tag_cols = [
+        str(f"tag_{sanitize_tag(t)}")
+        for t in tags
+        if f"tag_{sanitize_tag(t)}" in MODEL_FEATURES
+    ]
+
+    response = {
         "listing_id": listing_id,
         "predictions": {
             "currency": "AZN",
             "price_per_m2": price_per_m2,
             "total_price": total_price,
-            "min_price": total_price * 0.9,
-            "max_price": total_price * 1.1,
+            "min_price": float(total_price * 0.9),
+            "max_price": float(total_price * 1.1),
             "area_m2": float(p.area_m2),
         },
         "explain": {
-            "base_price_per_m2": base_value,
-            "delta_price_per_m2": price_per_m2 - base_value,
+            "base_price_per_m2": float(base_value),
+            "delta_price_per_m2": float(price_per_m2 - float(base_value)),
             "top_positive": _to_items(pos_df, 6),
             "top_negative": _to_items(neg_df, 6),
             "groups": _group_contributions(contrib_df),
@@ -346,28 +372,29 @@ def build_explain_response(p: PropertyFeatures, listing_id: Optional[str] = None
             "note": "CatBoost native SHAP. Units = AZN/m².",
         },
         "debug_model": {
-            "n_features": len(MODEL_FEATURES),
+            "n_features": int(len(MODEL_FEATURES)),
             "cat_indices_source": "model" if bool(MODEL_CAT_INDICES) else "inferred_from_df",
-            "has_tag_features": any(f.startswith("tag_") for f in MODEL_FEATURES),
-        }
+            "has_tag_features": bool(any(f.startswith("tag_") for f in MODEL_FEATURES)),
+        },
     }
 
+    # Final guarantee: nothing numpy/pandas leaks into output
+    return safe_json(response)
 
 # =========================================================
 # Endpoints
 # =========================================================
 @app.get("/health")
 def health():
-    return {
+    return safe_json({
         "status": "ok",
         "model": "catboost-avm-unit-price",
         "n_features": len(MODEL_FEATURES),
         "cat_indices_source": "model" if bool(MODEL_CAT_INDICES) else "inferred_from_df",
         "n_cat_features": len(MODEL_CAT_INDICES) if MODEL_CAT_INDICES else None,
         "has_tag_features": any(f.startswith("tag_") for f in MODEL_FEATURES),
-    }
+    })
 
-from fastapi.responses import JSONResponse
 
 @app.post("/predict/explain")
 def predict_explain(p: PropertyFeatures):
@@ -375,30 +402,26 @@ def predict_explain(p: PropertyFeatures):
         return build_explain_response(p)
     except Exception as e:
         traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)},
-        )
+        return JSONResponse(status_code=500, content=safe_json({"error": str(e)}))
 
 
-# Optional: keep /predict for later (internal use)
 @app.post("/predict")
 def predict(p: PropertyFeatures):
     request_id = str(uuid.uuid4())
     try:
         df = make_feature_row(p)
-        price_per_m2 = _predict_unit_price(df)
-        total_price = price_per_m2 * float(p.area_m2)
-        return {
+        price_per_m2 = float(_predict_unit_price(df))
+        total_price = float(price_per_m2 * float(p.area_m2))
+        return safe_json({
             "price_per_m2": price_per_m2,
             "total_price": total_price,
             "min_price": total_price * 0.9,
             "max_price": total_price * 1.1,
-        }
+        })
     except Exception as e:
         tb = traceback.format_exc()
         print(f"❌ /predict ERROR request_id={request_id}\n{tb}")
         raise HTTPException(
             status_code=500,
-            detail={"message": str(e), "request_id": request_id},
+            detail=safe_json({"message": str(e), "request_id": request_id}),
         )
