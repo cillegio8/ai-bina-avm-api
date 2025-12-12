@@ -134,6 +134,8 @@ class PropertyFeatures(BaseModel):
 
     property_type: str
     microlocation: str
+    # ✅ new: allow sending 3–4 micro areas
+    microlocations: Optional[List[str]] = None
     city: str
     təmir: Boolish
     çıxarış: Boolish
