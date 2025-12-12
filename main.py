@@ -11,15 +11,12 @@ app = FastAPI(title="AI-Bina AVM API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "https://YOUR_BOLT_DOMAIN_HERE"
-    ],
-    allow_credentials=True,
+    allow_origin_regex=r"^https://.*\.local-credentialless\.webcontainer-api\.io$",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # =========================================================
 # Load model once at startup
