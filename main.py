@@ -15,6 +15,24 @@ import numpy as np
 # =========================================================
 app = FastAPI(title="AI-Bina AVM API (MVP)")
 
+from fastapi.responses import JSONResponse
+from fastapi.requests import Request
+import traceback
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    tb = traceback.format_exc()
+    print("❌ UNHANDLED ERROR:", tb)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": str(exc),
+            "path": str(request.url.path),
+            "trace": tb,   # remove later
+        },
+    )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
