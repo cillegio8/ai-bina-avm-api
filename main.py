@@ -349,22 +349,17 @@ def health():
         "has_tag_features": any(f.startswith("tag_") for f in MODEL_FEATURES),
     }
 
+from fastapi.responses import JSONResponse
 
-# MVP: make explain the primary public endpoint
 @app.post("/predict/explain")
 def predict_explain(p: PropertyFeatures):
-    request_id = str(uuid.uuid4())
     try:
-        return build_explain_response(p, listing_id=None)
+        return build_explain_response(p)
     except Exception as e:
-        tb = traceback.format_exc()
-        print(f"❌ /predict/explain ERROR request_id={request_id}\n{tb}")
-        raise HTTPException(
+        traceback.print_exc()
+        return JSONResponse(
             status_code=500,
-            detail={
-                "message": str(e),
-                "request_id": request_id,
-            },
+            content={"error": str(e)},
         )
 
 
