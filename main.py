@@ -17,39 +17,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # =========================================================
 # Load model once at startup
 # =========================================================
 model = CatBoostRegressor()
 model.load_model("ai_bina_catboost_avm.cbm")
 
+# Use the model itself as the source of truth for feature order
+MODEL_FEATURES: List[str] = list(model.feature_names_ or [])
+if not MODEL_FEATURES:
+    # fallback (rare), but better to fail loudly than mispredict
+    raise RuntimeError("Model has no feature_names_. Re-train/export with feature names.")
 
 # =========================================================
-# Features used in model (must match training)
-# =========================================================
-FEATURE_COLUMNS = [
-    "location_name",
-    "city_name",
-    "area_m2",
-    "rooms",
-    "floor",
-    "floor_count",
-    "floor_ratio",
-    "leased",
-    "has_mortgage",
-    "has_bill_of_sale",
-    "has_repair",
-    "paid_daily",
-    "is_business",
-    "vipped",
-    "featured",
-    "photos_count",
-]
-
-
-# =========================================================
-# Schemas
+# Schemas (keep only what AVM model uses)
 # =========================================================
 class PropertyFeatures(BaseModel):
     location_name: str
@@ -58,15 +39,6 @@ class PropertyFeatures(BaseModel):
     rooms: int
     floor: int | None = None
     floor_count: int | None = None
-    leased: bool | None = None
-    has_mortgage: bool | None = None
-    has_bill_of_sale: bool | None = None
-    has_repair: bool | None = None
-    paid_daily: bool | None = None
-    is_business: bool | None = None
-    vipped: bool | None = None
-    featured: bool | None = None
-    photos_count: int | None = None
 
 
 class ExplanationResponse(BaseModel):
@@ -88,7 +60,8 @@ def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
     floor_count = p.floor_count or 1
     floor_ratio = floor / max(floor_count, 1)
 
-    row = {
+    # Build only the base fields you know
+    base_row: Dict[str, Any] = {
         "location_name": p.location_name,
         "city_name": p.city_name,
         "area_m2": p.area_m2,
@@ -96,17 +69,14 @@ def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
         "floor": floor,
         "floor_count": floor_count,
         "floor_ratio": floor_ratio,
-        "leased": int(p.leased) if p.leased is not None else 0,
-        "has_mortgage": int(p.has_mortgage) if p.has_mortgage is not None else 0,
-        "has_bill_of_sale": int(p.has_bill_of_sale) if p.has_bill_of_sale is not None else 0,
-        "has_repair": int(p.has_repair) if p.has_repair is not None else 0,
-        "paid_daily": int(p.paid_daily) if p.paid_daily is not None else 0,
-        "is_business": int(p.is_business) if p.is_business is not None else 0,
-        "vipped": int(p.vipped) if p.vipped is not None else 0,
-        "featured": int(p.featured) if p.featured is not None else 0,
-        "photos_count": p.photos_count or 0,
     }
-    return pd.DataFrame([row], columns=FEATURE_COLUMNS)
+
+    # Now produce a row that matches MODEL_FEATURES exactly:
+    # - keep only model-used keys
+    # - fill missing ones with 0 (safe default for numeric/binary)
+    row: Dict[str, Any] = {f: base_row.get(f, 0) for f in MODEL_FEATURES}
+
+    return pd.DataFrame([row], columns=MODEL_FEATURES)
 
 
 def catboost_contributions(df: pd.DataFrame) -> tuple[float, pd.DataFrame]:
@@ -117,13 +87,13 @@ def catboost_contributions(df: pd.DataFrame) -> tuple[float, pd.DataFrame]:
     """
     pool = Pool(df)
     shap_vals = model.get_feature_importance(pool, type="ShapValues")
-    # shap_vals shape: (n_rows, n_features + 1) last column = expected value (bias) in same space as prediction
+
     row_vals = shap_vals[0]
     contribs = row_vals[:-1]          # per-feature contributions
     base_log = float(row_vals[-1])    # bias term
 
     contrib_df = pd.DataFrame({
-        "feature": FEATURE_COLUMNS,
+        "feature": MODEL_FEATURES,
         "value": df.iloc[0].values,
         "contrib_log": contribs
     })
@@ -133,13 +103,13 @@ def catboost_contributions(df: pd.DataFrame) -> tuple[float, pd.DataFrame]:
 
 
 def group_contribs_from_df(contrib_df: pd.DataFrame) -> Dict[str, float]:
+    # Groups adjusted to the reduced feature set
     groups = {
         "location": ["location_name", "city_name"],
         "size": ["area_m2", "rooms"],
         "building": ["floor", "floor_count", "floor_ratio"],
-        "status": ["leased", "has_mortgage", "has_bill_of_sale", "has_repair", "paid_daily", "is_business"],
-        "marketing": ["vipped", "featured", "photos_count"],
     }
+
     out: Dict[str, float] = {}
     for g, feats in groups.items():
         out[g] = float(contrib_df.loc[contrib_df["feature"].isin(feats), "contrib_log"].sum())
@@ -172,7 +142,6 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
                 "display_name": r["feature"],
                 "value": r["value"],
                 "contrib_log": float(r["contrib_log"]),
-                # approx effect in AZN/m² (local linearization around prediction)
                 "approx_impact_price_per_m2": float(price_per_m2 * (np.exp(float(r["contrib_log"])) - 1.0)),
                 "abs_importance": float(r["abs_importance"]),
             })
@@ -195,7 +164,8 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
             "base_price_per_m2": base_price_per_m2,
             "delta_price_per_m2": delta_price_per_m2,
             "relative_position": relative_position,
-            "note": "Contributions computed using CatBoost ShapValues in log-space (no shap python dependency).",
+            "note": "Contributions computed using CatBoost ShapValues in log-space.",
+            "model_features": MODEL_FEATURES,
         },
         "key_attributes": {
             "location_name": p.location_name,
@@ -203,15 +173,10 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
             "rooms": p.rooms,
             "floor": p.floor,
             "floor_count": p.floor_count,
-            "leased": p.leased,
-            "has_repair": p.has_repair,
-            "has_bill_of_sale": p.has_bill_of_sale,
-            "has_mortgage": p.has_mortgage,
         },
         "top_positive_contributors": df_to_list(pos_df, limit=6),
         "top_negative_contributors": df_to_list(neg_df, limit=6),
         "all_contributors": df_to_list(contrib_df, limit=30),
-        # group contributions in log-space (sum of log contributions per group)
         "group_contributions": {k: float(v) for k, v in group_contribs_log.items()},
     }
 
@@ -221,7 +186,7 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
 # =========================================================
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "model_features": MODEL_FEATURES}
 
 
 @app.post("/predict")
