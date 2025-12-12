@@ -1,6 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 
 from catboost import CatBoostRegressor, Pool
@@ -23,22 +23,31 @@ app.add_middleware(
 model = CatBoostRegressor()
 model.load_model("ai_bina_catboost_avm.cbm")
 
-# Use the model itself as the source of truth for feature order
-MODEL_FEATURES: List[str] = list(model.feature_names_ or [])
-if not MODEL_FEATURES:
-    # fallback (rare), but better to fail loudly than mispredict
-    raise RuntimeError("Model has no feature_names_. Re-train/export with feature names.")
+# =========================================================
+# Feature definitions (MUST match training)
+# =========================================================
+FEATURE_NUMERIC = ["area_m2", "rooms", "floor", "floors_total"]
+FEATURE_CATEGORICAL = ["property_type", "microlocation", "city", "təmir", "çıxarış"]
+FEATURE_COLUMNS = FEATURE_NUMERIC + FEATURE_CATEGORICAL
+
+# CatBoost needs to know which columns are categorical
+CAT_FEATURES = FEATURE_CATEGORICAL  # can be names
+
 
 # =========================================================
-# Schemas (keep only what AVM model uses)
+# Schemas
 # =========================================================
 class PropertyFeatures(BaseModel):
-    location_name: str
-    city_name: str
-    area_m2: float
-    rooms: int
-    floor: int | None = None
-    floor_count: int | None = None
+    area_m2: float = Field(..., gt=0)
+    rooms: int = Field(..., ge=0)
+    floor: Optional[int] = None
+    floors_total: Optional[int] = None
+
+    property_type: str
+    microlocation: str
+    city: str
+    təmir: str
+    çıxarış: str
 
 
 class ExplanationResponse(BaseModel):
@@ -56,99 +65,94 @@ class ExplanationResponse(BaseModel):
 # Helpers
 # =========================================================
 def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
-    floor = p.floor or 0
-    floor_count = p.floor_count or 1
-    floor_ratio = floor / max(floor_count, 1)
+    # robust defaults
+    floor = p.floor if p.floor is not None else 0
+    floors_total = p.floors_total if p.floors_total is not None else 0
 
-    # Build only the base fields you know
-    base_row: Dict[str, Any] = {
-        "location_name": p.location_name,
-        "city_name": p.city_name,
-        "area_m2": p.area_m2,
-        "rooms": p.rooms,
-        "floor": floor,
-        "floor_count": floor_count,
-        "floor_ratio": floor_ratio,
+    row: Dict[str, Any] = {
+        "area_m2": float(p.area_m2),
+        "rooms": int(p.rooms),
+        "floor": int(floor),
+        "floors_total": int(floors_total),
+
+        # categorical as strings (CatBoost handles categories)
+        "property_type": str(p.property_type or ""),
+        "microlocation": str(p.microlocation or ""),
+        "city": str(p.city or ""),
+        "təmir": str(p.təmir or ""),
+        "çıxarış": str(p.çıxarış or ""),
     }
 
-    # Now produce a row that matches MODEL_FEATURES exactly:
-    # - keep only model-used keys
-    # - fill missing ones with 0 (safe default for numeric/binary)
-    row: Dict[str, Any] = {f: base_row.get(f, 0) for f in MODEL_FEATURES}
-
-    return pd.DataFrame([row], columns=MODEL_FEATURES)
+    # Ensure exact column order
+    return pd.DataFrame([row], columns=FEATURE_COLUMNS)
 
 
 def catboost_contributions(df: pd.DataFrame) -> tuple[float, pd.DataFrame]:
-    """
-    Returns:
-      base_log (bias term, log-space)
-      contrib_df with per-feature contributions in log-space
-    """
-    pool = Pool(df)
+    pool = Pool(df, cat_features=CAT_FEATURES)
     shap_vals = model.get_feature_importance(pool, type="ShapValues")
 
     row_vals = shap_vals[0]
-    contribs = row_vals[:-1]          # per-feature contributions
-    base_log = float(row_vals[-1])    # bias term
+    contribs = row_vals[:-1]
+    base = float(row_vals[-1])
 
     contrib_df = pd.DataFrame({
-        "feature": MODEL_FEATURES,
+        "feature": FEATURE_COLUMNS,
         "value": df.iloc[0].values,
-        "contrib_log": contribs
+        "contrib": contribs
     })
-    contrib_df["abs_importance"] = np.abs(contrib_df["contrib_log"])
+    contrib_df["abs_importance"] = np.abs(contrib_df["contrib"])
     contrib_df = contrib_df.sort_values("abs_importance", ascending=False)
-    return base_log, contrib_df
+    return base, contrib_df
 
 
 def group_contribs_from_df(contrib_df: pd.DataFrame) -> Dict[str, float]:
-    # Groups adjusted to the reduced feature set
     groups = {
-        "location": ["location_name", "city_name"],
+        "location": ["microlocation", "city"],
+        "property": ["property_type"],
+        "condition_docs": ["təmir", "çıxarış"],
         "size": ["area_m2", "rooms"],
-        "building": ["floor", "floor_count", "floor_ratio"],
+        "building": ["floor", "floors_total"],
     }
-
     out: Dict[str, float] = {}
     for g, feats in groups.items():
-        out[g] = float(contrib_df.loc[contrib_df["feature"].isin(feats), "contrib_log"].sum())
+        out[g] = float(contrib_df.loc[contrib_df["feature"].isin(feats), "contrib"].sum())
     return out
 
 
 def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None) -> Dict[str, Any]:
     df = make_feature_row(p)
 
-    # Predict in log space then exp
-    y_log = float(model.predict(df)[0])
-    price_per_m2 = float(np.exp(y_log))
+    pool = Pool(df, cat_features=CAT_FEATURES)
+    pred = float(model.predict(pool)[0])  # note: this is whatever target space you trained on
+
+    # If you trained on log(price_per_m2), keep exp here.
+    # If you trained directly on AZN/m², remove exp.
+    # -----
+    # IMPORTANT: choose ONE and keep it consistent with training.
+    price_per_m2 = float(np.exp(pred))  # <-- keep only if model trained on log
+    # price_per_m2 = pred              # <-- use this if model trained directly on AZN/m²
+
     total_price = price_per_m2 * p.area_m2
-    min_price = total_price * 0.9
-    max_price = total_price * 1.1
 
-    # CatBoost-native contributions (log-space)
-    base_log, contrib_df = catboost_contributions(df)
-    base_price_per_m2 = float(np.exp(base_log))
-    delta_price_per_m2 = price_per_m2 - base_price_per_m2
-    relative_position = "higher" if delta_price_per_m2 >= 0 else "lower"
+    base, contrib_df = catboost_contributions(df)
+    # base_price_per_m2 = float(np.exp(base))  # if log-trained
+    base_price_per_m2 = float(np.exp(base))   # keep consistent with above
 
-    group_contribs_log = group_contribs_from_df(contrib_df)
+    group_contribs = group_contribs_from_df(contrib_df)
 
     def df_to_list(sub_df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for _, r in sub_df.head(limit).iterrows():
             out.append({
                 "feature": r["feature"],
-                "display_name": r["feature"],
                 "value": r["value"],
-                "contrib_log": float(r["contrib_log"]),
-                "approx_impact_price_per_m2": float(price_per_m2 * (np.exp(float(r["contrib_log"])) - 1.0)),
+                "contrib": float(r["contrib"]),
                 "abs_importance": float(r["abs_importance"]),
             })
         return out
 
-    pos_df = contrib_df[contrib_df["contrib_log"] > 0]
-    neg_df = contrib_df[contrib_df["contrib_log"] < 0]
+    pos_df = contrib_df[contrib_df["contrib"] > 0]
+    neg_df = contrib_df[contrib_df["contrib"] < 0]
 
     return {
         "listing_id": listing_id,
@@ -156,28 +160,31 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
             "currency": "AZN",
             "price_per_m2": price_per_m2,
             "total_price": total_price,
-            "min_price": min_price,
-            "max_price": max_price,
+            "min_price": total_price * 0.9,
+            "max_price": total_price * 1.1,
             "area_m2": p.area_m2,
         },
         "model_info": {
             "base_price_per_m2": base_price_per_m2,
-            "delta_price_per_m2": delta_price_per_m2,
-            "relative_position": relative_position,
-            "note": "Contributions computed using CatBoost ShapValues in log-space.",
-            "model_features": MODEL_FEATURES,
+            "note": "Contributions computed using CatBoost ShapValues.",
+            "features": FEATURE_COLUMNS,
+            "categorical_features": FEATURE_CATEGORICAL,
         },
         "key_attributes": {
-            "location_name": p.location_name,
-            "city_name": p.city_name,
+            "property_type": p.property_type,
+            "microlocation": p.microlocation,
+            "city": p.city,
+            "təmir": p.təmir,
+            "çıxarış": p.çıxarış,
             "rooms": p.rooms,
             "floor": p.floor,
-            "floor_count": p.floor_count,
+            "floors_total": p.floors_total,
+            "area_m2": p.area_m2,
         },
         "top_positive_contributors": df_to_list(pos_df, limit=6),
         "top_negative_contributors": df_to_list(neg_df, limit=6),
         "all_contributors": df_to_list(contrib_df, limit=30),
-        "group_contributions": {k: float(v) for k, v in group_contribs_log.items()},
+        "group_contributions": {k: float(v) for k, v in group_contribs.items()},
     }
 
 
@@ -186,14 +193,20 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
 # =========================================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_features": MODEL_FEATURES}
+    return {
+        "status": "ok",
+        "features": FEATURE_COLUMNS,
+        "categorical_features": FEATURE_CATEGORICAL,
+    }
 
 
 @app.post("/predict")
 def predict(p: PropertyFeatures):
     df = make_feature_row(p)
-    y_log = float(model.predict(df)[0])
-    price_per_m2 = float(np.exp(y_log))
+    pool = Pool(df, cat_features=CAT_FEATURES)
+    pred = float(model.predict(pool)[0])
+
+    price_per_m2 = float(np.exp(pred))  # keep consistent with training
     total_price = price_per_m2 * p.area_m2
     return {
         "price_per_m2": price_per_m2,
@@ -204,5 +217,5 @@ def predict(p: PropertyFeatures):
 
 
 @app.post("/predict_explain", response_model=ExplanationResponse)
-def predict_explain(p: PropertyFeatures, listing_id: Optional[str] = None) -> ExplanationResponse:
+def predict_explain(p: PropertyFeatures, listing_id: Optional[str] = Query(default=None)) -> ExplanationResponse:
     return ExplanationResponse(**build_explanation_json(p, listing_id=listing_id))
