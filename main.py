@@ -28,18 +28,24 @@ app.add_middleware(
 model = CatBoostRegressor()
 model.load_model("ai_bina_catboost_avm.cbm")
 
-# ✅ Model-driven schema (version-safe)
+# =========================================================
+# Model-driven schema (version-safe)
+# =========================================================
 def _get_model_feature_names(m: CatBoostRegressor) -> List[str]:
-    # Newer CatBoost sometimes has get_feature_names(), older often has feature_names_
+    # Older CatBoost often has feature_names_
     names = getattr(m, "feature_names_", None)
     if names:
         return list(names)
+
+    # Some builds have get_feature_names()
     if hasattr(m, "get_feature_names"):
         try:
             return list(m.get_feature_names())  # type: ignore[attr-defined]
         except Exception:
             pass
+
     return []
+
 
 def _get_model_cat_indices(m: CatBoostRegressor) -> List[int]:
     if hasattr(m, "get_cat_feature_indices"):
@@ -47,20 +53,18 @@ def _get_model_cat_indices(m: CatBoostRegressor) -> List[int]:
             return list(m.get_cat_feature_indices())  # type: ignore[attr-defined]
         except Exception:
             pass
-    # some versions store cat feature indices internally, but not exposed
     return []
+
 
 MODEL_FEATURES: List[str] = _get_model_feature_names(model)
 MODEL_CAT_INDICES: List[int] = _get_model_cat_indices(model)
 
 if not MODEL_FEATURES:
-    # Hard fail with a clear message (better than silent wrong predictions)
     raise RuntimeError(
         "Could not read feature names from CatBoost model. "
         "Your CatBoost build does not expose feature_names_. "
-        "Fix by upgrading catboost or providing a FEATURE_NAMES list in code."
+        "Fix by upgrading catboost or hardcoding FEATURE_NAMES."
     )
- 
 
 # =========================================================
 # Normalizers (frontend-friendly -> model-friendly)
@@ -78,7 +82,6 @@ def normalize_cixarish(value: Boolish) -> str:
     """
     Normalize 'çıxarış' into model categories:
       - "var" | "yoxdur"
-    Accepts: Yes/No, true/false, 1/0, var/yoxdur, bəli/yox, etc.
     """
     v = _norm_str(value)
 
@@ -93,7 +96,6 @@ def normalize_temir(value: Boolish) -> str:
     """
     Normalize 'təmir' into model categories:
       - "təmirli" | "təmir tələb edir"
-    Accepts: Yes/No, true/false, 1/0, təmirli/təmirsiz/natəmirsiz, etc.
     """
     v = _norm_str(value)
 
@@ -146,6 +148,9 @@ def sanitize_tag(tag: str) -> str:
 
 def is_cat_feature_name(col: str) -> bool:
     """Check if a model feature name is categorical (by index)."""
+    if not MODEL_CAT_INDICES:
+        # If cat indices are unknown, we cannot reliably know from model
+        return False
     try:
         idx = MODEL_FEATURES.index(col)
         return idx in MODEL_CAT_INDICES
@@ -176,7 +181,6 @@ def extract_microlocation_tags(
     else:
         s = (microlocation or "").strip()
         if s:
-            # split by common separators (* from Bina, comma, semicolon, pipe)
             parts = re.split(r"[\*\|;,]+", s)
             for p in parts:
                 pp = p.strip()
@@ -207,7 +211,6 @@ class PropertyFeatures(BaseModel):
     property_type: str
     city: str
 
-    # microlocation:
     microlocation: str
     microlocations: Optional[List[str]] = None  # ✅ allow 3–4 items
 
@@ -227,6 +230,17 @@ class ExplanationResponse(BaseModel):
 
 
 # =========================================================
+# Cat feature indices fallback (if model doesn't expose them)
+# =========================================================
+def _cat_indices_for_df(df: pd.DataFrame) -> List[int]:
+    # Prefer model-provided indices if present
+    if MODEL_CAT_INDICES:
+        return MODEL_CAT_INDICES
+    # Fallback: infer categorical columns by dtype (object)
+    return [i for i, c in enumerate(df.columns) if df[c].dtype == "object"]
+
+
+# =========================================================
 # Helpers
 # =========================================================
 def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
@@ -241,10 +255,14 @@ def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
     temir = normalize_temir(p.təmir)
     cixarish = normalize_cixarish(p.çıxarış)
 
-    # init row with correct defaults per feature type
+    # init row with correct defaults
     row: Dict[str, Any] = {}
     for f in MODEL_FEATURES:
-        row[f] = "" if is_cat_feature_name(f) else 0
+        # If we don't know cat indices, default to numeric 0 and overwrite cats later
+        if MODEL_CAT_INDICES:
+            row[f] = "" if is_cat_feature_name(f) else 0
+        else:
+            row[f] = 0
 
     # numeric
     if "area_m2" in row:
@@ -270,22 +288,28 @@ def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
     tags = extract_microlocation_tags(p.microlocation, p.microlocations, max_tags=6)
     primary = tags[0] if tags else (p.microlocation or "")
 
-    # if model expects categorical microlocation, set primary
+    # categorical microlocation (if present)
     if "microlocation" in row:
         row["microlocation"] = str(primary)
 
-    # if model has tag_* one-hot columns, set multiple tags
+    # tag_* one-hot (if present in model)
     for t in tags:
         col = f"tag_{sanitize_tag(t)}"
         if col in row:
             row[col] = 1
 
-    # build df in exact model order
-    return pd.DataFrame([[row[f] for f in MODEL_FEATURES]], columns=MODEL_FEATURES)
+    # If we inferred cats, ensure string columns are actually strings (dtype object)
+    # This helps Pool(cat_features=inferred) behave correctly.
+    df = pd.DataFrame([[row[f] for f in MODEL_FEATURES]], columns=MODEL_FEATURES)
+    for i in _cat_indices_for_df(df):
+        c = df.columns[i]
+        df[c] = df[c].astype(str)
+
+    return df
 
 
 def predict_price_per_m2(df: pd.DataFrame) -> float:
-    pool = Pool(df, cat_features=MODEL_CAT_INDICES)
+    pool = Pool(df, cat_features=_cat_indices_for_df(df))
     return float(model.predict(pool)[0])
 
 
@@ -295,7 +319,7 @@ def catboost_contributions(df: pd.DataFrame) -> Tuple[float, pd.DataFrame]:
       base_value: model expected value (bias)
       contrib_df: per-feature contributions (same units as target: AZN/m²)
     """
-    pool = Pool(df, cat_features=MODEL_CAT_INDICES)
+    pool = Pool(df, cat_features=_cat_indices_for_df(df))
     shap_vals = model.get_feature_importance(pool, type="ShapValues")
 
     row_vals = shap_vals[0]          # n_features + 1
@@ -314,12 +338,12 @@ def group_contributions(contrib_df: pd.DataFrame) -> Dict[str, float]:
     tag_cols = [c for c in MODEL_FEATURES if c.startswith("tag_")]
 
     groups = {
-        "location": ["city", "microlocation"] + tag_cols,
-        "size": ["area_m2", "rooms"],
-        "building": ["floor", "floors_total"],
-        "legal": ["çıxarış"],
-        "condition": ["təmir"],
-        "type": ["property_type"],
+        "location": [c for c in ["city", "microlocation"] if c in MODEL_FEATURES] + tag_cols,
+        "size": [c for c in ["area_m2", "rooms"] if c in MODEL_FEATURES],
+        "building": [c for c in ["floor", "floors_total"] if c in MODEL_FEATURES],
+        "legal": [c for c in ["çıxarış"] if c in MODEL_FEATURES],
+        "condition": [c for c in ["təmir"] if c in MODEL_FEATURES],
+        "type": [c for c in ["property_type"] if c in MODEL_FEATURES],
     }
 
     out: Dict[str, float] = {}
@@ -391,7 +415,7 @@ def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None
             "base_price_per_m2": base_value,
             "delta_price_per_m2": delta,
             "relative_position": relative_position,
-            "note": "CatBoost native SHAP values. Target = unit_price (AZN/m²). Schema from model.get_feature_names().",
+            "note": "CatBoost native SHAP values. Target = unit_price (AZN/m²).",
         },
         "key_attributes": key_attrs,
         "top_positive_contributors": df_to_list(pos_df, 6),
@@ -410,6 +434,7 @@ def health():
         "status": "ok",
         "model": "catboost-avm-unit-price",
         "n_features": len(MODEL_FEATURES),
+        "cat_indices_source": "model" if bool(MODEL_CAT_INDICES) else "inferred_from_df",
         "n_cat_features": len(MODEL_CAT_INDICES),
         "has_tag_features": any(f.startswith("tag_") for f in MODEL_FEATURES),
     }
@@ -421,7 +446,6 @@ def predict(p: PropertyFeatures):
         df = make_feature_row(p)
         price_per_m2 = predict_price_per_m2(df)
         total_price = price_per_m2 * float(p.area_m2)
-
         return {
             "price_per_m2": price_per_m2,
             "total_price": total_price,
