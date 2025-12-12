@@ -1,7 +1,8 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List, Tuple
+import traceback
 
 from catboost import CatBoostRegressor, Pool
 import pandas as pd
@@ -45,7 +46,9 @@ FEATURE_CATEGORICAL = [
 ]
 
 FEATURE_COLUMNS = FEATURE_NUMERIC + FEATURE_CATEGORICAL
-CAT_FEATURES = FEATURE_CATEGORICAL  # pass names to Pool
+
+# Safer than passing names (works reliably across CatBoost versions)
+CAT_FEATURE_INDICES = [FEATURE_COLUMNS.index(c) for c in FEATURE_CATEGORICAL]
 
 # =========================================================
 # Schemas
@@ -93,18 +96,23 @@ def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
     return pd.DataFrame([row], columns=FEATURE_COLUMNS)
 
 
+def predict_price_per_m2(df: pd.DataFrame) -> float:
+    pool = Pool(df, cat_features=CAT_FEATURE_INDICES)
+    return float(model.predict(pool)[0])
+
+
 def catboost_contributions(df: pd.DataFrame) -> Tuple[float, pd.DataFrame]:
     """
     Returns:
-      base_value: model bias (expected value)
-      contrib_df: per-feature contributions (same units as target)
+      base_value: model expected value (bias)
+      contrib_df: per-feature contributions (same units as target: AZN/m²)
     """
-    pool = Pool(df, cat_features=CAT_FEATURES)
+    pool = Pool(df, cat_features=CAT_FEATURE_INDICES)
     shap_vals = model.get_feature_importance(pool, type="ShapValues")
 
-    row_vals = shap_vals[0]
-    contribs = row_vals[:-1]
-    base_value = float(row_vals[-1])
+    row_vals = shap_vals[0]               # n_features + 1
+    contribs = row_vals[:-1]              # per-feature
+    base_value = float(row_vals[-1])      # expected value
 
     contrib_df = pd.DataFrame(
         {
@@ -115,7 +123,6 @@ def catboost_contributions(df: pd.DataFrame) -> Tuple[float, pd.DataFrame]:
     )
     contrib_df["abs_importance"] = np.abs(contrib_df["contrib"])
     contrib_df = contrib_df.sort_values("abs_importance", ascending=False)
-
     return base_value, contrib_df
 
 
@@ -131,18 +138,14 @@ def group_contributions(contrib_df: pd.DataFrame) -> Dict[str, float]:
 
     out: Dict[str, float] = {}
     for group, feats in groups.items():
-        out[group] = float(
-            contrib_df.loc[contrib_df["feature"].isin(feats), "contrib"].sum()
-        )
+        out[group] = float(contrib_df.loc[contrib_df["feature"].isin(feats), "contrib"].sum())
     return out
 
 
-def build_explanation_json(
-    p: PropertyFeatures, listing_id: Optional[str] = None
-) -> Dict[str, Any]:
+def build_explanation_json(p: PropertyFeatures, listing_id: Optional[str] = None) -> Dict[str, Any]:
     df = make_feature_row(p)
 
-    price_per_m2 = float(model.predict(df)[0])
+    price_per_m2 = predict_price_per_m2(df)
     total_price = price_per_m2 * p.area_m2
 
     base_value, contrib_df = catboost_contributions(df)
@@ -151,7 +154,7 @@ def build_explanation_json(
     relative_position = "higher" if delta > 0 else "lower" if delta < 0 else "same"
 
     def df_to_list(df_sub: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
-        out = []
+        out: List[Dict[str, Any]] = []
         for _, r in df_sub.head(limit).iterrows():
             out.append(
                 {
@@ -211,16 +214,22 @@ def health():
 
 @app.post("/predict")
 def predict(p: PropertyFeatures):
-    df = make_feature_row(p)
-    price_per_m2 = float(model.predict(df)[0])
-    total_price = price_per_m2 * p.area_m2
+    try:
+        df = make_feature_row(p)
+        price_per_m2 = predict_price_per_m2(df)
+        total_price = price_per_m2 * p.area_m2
 
-    return {
-        "price_per_m2": price_per_m2,
-        "total_price": total_price,
-        "min_price": total_price * 0.9,
-        "max_price": total_price * 1.1,
-    }
+        return {
+            "price_per_m2": price_per_m2,
+            "total_price": total_price,
+            "min_price": total_price * 0.9,
+            "max_price": total_price * 1.1,
+        }
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("❌ PREDICT ERROR:")
+        print(tb)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/predict_explain", response_model=ExplanationResponse)
@@ -228,6 +237,10 @@ def predict_explain(
     p: PropertyFeatures,
     listing_id: Optional[str] = Query(default=None),
 ):
-    return ExplanationResponse(
-        **build_explanation_json(p, listing_id=listing_id)
-    )
+    try:
+        return ExplanationResponse(**build_explanation_json(p, listing_id=listing_id))
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("❌ PREDICT_EXPLAIN ERROR:")
+        print(tb)
+        raise HTTPException(status_code=500, detail=str(e))
