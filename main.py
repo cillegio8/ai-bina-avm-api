@@ -28,9 +28,39 @@ app.add_middleware(
 model = CatBoostRegressor()
 model.load_model("ai_bina_catboost_avm.cbm")
 
-# ✅ Model-driven schema (source of truth)
-MODEL_FEATURES: List[str] = model.get_feature_names()
-MODEL_CAT_INDICES: List[int] = list(model.get_cat_feature_indices())
+# ✅ Model-driven schema (version-safe)
+def _get_model_feature_names(m: CatBoostRegressor) -> List[str]:
+    # Newer CatBoost sometimes has get_feature_names(), older often has feature_names_
+    names = getattr(m, "feature_names_", None)
+    if names:
+        return list(names)
+    if hasattr(m, "get_feature_names"):
+        try:
+            return list(m.get_feature_names())  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return []
+
+def _get_model_cat_indices(m: CatBoostRegressor) -> List[int]:
+    if hasattr(m, "get_cat_feature_indices"):
+        try:
+            return list(m.get_cat_feature_indices())  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    # some versions store cat feature indices internally, but not exposed
+    return []
+
+MODEL_FEATURES: List[str] = _get_model_feature_names(model)
+MODEL_CAT_INDICES: List[int] = _get_model_cat_indices(model)
+
+if not MODEL_FEATURES:
+    # Hard fail with a clear message (better than silent wrong predictions)
+    raise RuntimeError(
+        "Could not read feature names from CatBoost model. "
+        "Your CatBoost build does not expose feature_names_. "
+        "Fix by upgrading catboost or providing a FEATURE_NAMES list in code."
+    )
+ 
 
 # =========================================================
 # Normalizers (frontend-friendly -> model-friendly)
