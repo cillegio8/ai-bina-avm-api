@@ -458,16 +458,36 @@ def predict(p: PropertyFeatures):
         print(tb)
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/predict_explain", response_model=ExplanationResponse)
-def predict_explain(
-    p: PropertyFeatures,
-    listing_id: Optional[str] = Query(default=None),
-):
+@app.post("/predict/explain")
+def predict_explain(payload: PropertyFeatures):
     try:
-        return ExplanationResponse(**build_explanation_json(p, listing_id=listing_id))
+        df = pd.DataFrame([payload.dict()])
+
+        FEATURES = model.feature_names_
+        df = df[FEATURES]
+
+        # fill
+        for c in CAT_FEATURES:
+            df[c] = df[c].fillna("unknown").astype(str)
+
+        for c in NUM_FEATURES:
+            df[c] = df[c].fillna(0)
+
+        pool = Pool(
+            df,
+            cat_features=[FEATURES.index(c) for c in CAT_FEATURES]
+        )
+
+        shap = model.get_feature_importance(
+            type="ShapValues",
+            data=pool
+        )
+
+        # last column is base value
+        contrib = shap[0][:-1]
+
+        return dict(zip(FEATURES, contrib))
+
     except Exception as e:
-        tb = traceback.format_exc()
-        print("❌ PREDICT_EXPLAIN ERROR:")
-        print(tb)
-        raise HTTPException(status_code=500, detail=str(e))
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
