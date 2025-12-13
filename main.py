@@ -83,7 +83,8 @@ app.add_middleware(
 # Load model (ONCE)
 # =========================================================
 model = CatBoostRegressor()
-model.load_model("ai_bina_catboost_avm.cbm")
+model.load_model("/app/ai_bina_catboost_avm.cbm")
+
 
 # =========================================================
 # Model metadata (version-safe)
