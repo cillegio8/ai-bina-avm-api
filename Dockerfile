@@ -18,7 +18,7 @@ COPY main.py .
 # -----------------------------
 # Download artifacts from GitHub Release
 # -----------------------------
-ARG MODEL_VERSION="v2_multihot2000"
+ARG MODEL_VERSION="v2_multihot187"
 ARG BASE_URL="https://github.com/cillegio8/ai-bina-avm-api/releases/download/${MODEL_VERSION}"
 
 RUN set -eux; \
