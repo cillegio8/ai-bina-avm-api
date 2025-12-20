@@ -341,3 +341,69 @@ def predict_explain(p: PropertyFeatures):
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=500, content=safe_json({"error": str(e)}))
+
+
+# =========================================================
+# Vocab endpoints (microlocation tags)
+# =========================================================
+
+def _normalize_query(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+@app.get("/vocab")
+def vocab(
+    q: Optional[str] = None,
+    limit: int = 50,
+):
+    """
+    Returns microlocation tags for UI.
+    - If q is provided: returns tags containing q (case-insensitive)
+    - limit caps results (server-side safety)
+    """
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 50
+    limit = max(1, min(limit, 200))  # hard cap for safety
+
+    if not isinstance(VOCAB, list):
+        raise HTTPException(status_code=500, detail=safe_json({"message": "VOCAB is not a list"}))
+
+    if q is None or str(q).strip() == "":
+        # Default: top of vocab (already ordered by frequency in training)
+        tags = VOCAB[:limit]
+    else:
+        nq = _normalize_query(q)
+        tags = []
+        for t in VOCAB:
+            if nq in _normalize_query(str(t)):
+                tags.append(t)
+                if len(tags) >= limit:
+                    break
+
+    return safe_json({
+        "schema_version": str(SCHEMA.get("version")),
+        "model_version": str(MODEL_VERSION),
+        "prefix": str(PREFIX),
+        "vocab_len": int(len(VOCAB)),
+        "limit": int(limit),
+        "query": q,
+        "tags": [str(t) for t in tags],
+    })
+
+
+@app.get("/vocab/exists")
+def vocab_exists(tag: str):
+    """
+    Quick check whether a tag exists in vocab.
+    Useful for debugging / admin UI.
+    """
+    t = str(tag)
+    return safe_json({
+        "schema_version": str(SCHEMA.get("version")),
+        "model_version": str(MODEL_VERSION),
+        "tag": t,
+        "exists": bool(t in VOCAB_INDEX),
+        "index": int(VOCAB_INDEX[t]) if t in VOCAB_INDEX else None,
+    })
+
