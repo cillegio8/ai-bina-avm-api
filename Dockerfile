@@ -22,16 +22,13 @@ ARG MODEL_VERSION="v2_multihot2000"
 ARG BASE_URL="https://github.com/cillegio8/ai-bina-avm-api/releases/download/${MODEL_VERSION}"
 
 RUN set -eux; \
-    mkdir -p /app/artifacts/${MODEL_VERSION}; \
+    mkdir -p "/app/artifacts/${MODEL_VERSION}"; \
     echo "Downloading artifacts from: ${BASE_URL}"; \
     curl -L --fail "${BASE_URL}/avm_catboost_multihot2000.cbm" -o "/app/artifacts/${MODEL_VERSION}/avm_catboost_multihot2000.cbm"; \
-    curl -L --fail "${BASE_URL}/training_schema.json"         -o "/app/artifacts/${MODEL_VERSION}/training_schema.json"; \
     curl -L --fail "${BASE_URL}/microlocation_vocab.json"     -o "/app/artifacts/${MODEL_VERSION}/microlocation_vocab.json"; \
-    (curl -L --fail "${BASE_URL}/metrics.json" -o "/app/artifacts/${MODEL_VERSION}/metrics.json" || true); \
+    curl -L --fail "${BASE_URL}/training_schema.json"         -o "/app/artifacts/${MODEL_VERSION}/training_schema.json"; \
     ls -lah "/app/artifacts/${MODEL_VERSION}"
 
-# Expose port
 EXPOSE 8080
 
-# Uvicorn command (Northflank-compatible)
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
