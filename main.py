@@ -9,7 +9,7 @@ import re
 import uuid
 import json
 from pathlib import Path
-
+import os
 
 from catboost import CatBoostRegressor, Pool
 import pandas as pd
@@ -18,7 +18,8 @@ import numpy as np
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="AI-Bina AVM API (v2 multihot2000)")
+MODEL_VERSION = os.getenv("MODEL_VERSION", "v2_multihot190")
+app = FastAPI(title=f"AI-Bina AVM API ({MODEL_VERSION})")
 
 # =========================================================
 # JSON safety
@@ -63,18 +64,22 @@ app.add_middleware(
 # =========================================================
 # Load schema + vocab + model (from GitHub Release assets)
 # =========================================================
-ART_DIR = Path("/app/artifacts/v2_multihot2000")
+ART_DIR = Path(f"/app/artifacts/{MODEL_VERSION}")
 
-MODEL_PATH = ART_DIR / "avm_catboost_multihot2000.cbm"
 SCHEMA_PATH = ART_DIR / "training_schema.json"
-VOCAB_PATH = ART_DIR / "microlocation_vocab.json"
-
-for p in [MODEL_PATH, SCHEMA_PATH, VOCAB_PATH]:
-    if not p.exists():
-        raise RuntimeError(f"Missing artifact: {p}")
+if not SCHEMA_PATH.exists():
+    raise RuntimeError(f"Missing artifact: {SCHEMA_PATH}")
 
 with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
     SCHEMA = json.load(f)
+
+MODEL_PATH = ART_DIR / SCHEMA["model_file"]
+VOCAB_PATH = ART_DIR / SCHEMA["vocab_file"]
+
+for p in [MODEL_PATH, VOCAB_PATH]:
+    if not p.exists():
+        raise RuntimeError(f"Missing artifact: {p}")
+
 with open(VOCAB_PATH, "r", encoding="utf-8") as f:
     VOCAB = json.load(f)
 
@@ -112,7 +117,7 @@ def normalize_property_type(value: Optional[str]) -> str:
 def normalize_repair(value: Boolish) -> str:
     """
     Must match TRAINING df['repair'] labels.
-    Your dataset shows 'repaired' and 'unknown'. So we map everything into those.
+    Your curated dataset shows: 'repaired' and 'unknown'
     """
     v = _norm_str(value)
     if v in {"yes", "true", "1", "təmirli", "temirli", "repaired", "good", "əla", "ela", "yaxşı", "yaxsi"}:
@@ -156,7 +161,10 @@ class PropertyFeatures(BaseModel):
     microlocation: str = ""
     microlocations: Optional[List[str]] = None
 
-    # Keep old fields so frontend doesn't break
+    # NEW preferred field (future)
+    repair: Optional[str] = None
+
+    # Backward compatible old fields
     city: Optional[str] = None
     təmir: Boolish = None
     çıxarış: Boolish = None
@@ -175,9 +183,12 @@ def make_feature_row(p: PropertyFeatures) -> pd.DataFrame:
 
     # categoricals
     row["property_type"] = normalize_property_type(p.property_type)
-    row["repair"] = normalize_repair(p.təmir)
 
-    # microlocations -> ml__0000..ml__1999
+    # repair: prefer explicit repair field, fallback to təmir
+    repair_in = p.repair if (p.repair is not None and str(p.repair).strip() != "") else p.təmir
+    row["repair"] = normalize_repair(repair_in)
+
+    # microlocations -> ml__0000..ml__XXXX
     tags = extract_microlocation_tags(p.microlocation, p.microlocations, max_tags=20)
     for t in set(tags):
         j = VOCAB_INDEX.get(str(t))
@@ -280,6 +291,8 @@ def build_explain_response(p: PropertyFeatures) -> Dict[str, Any]:
             "n_features": int(len(FEATURES)),
             "n_cat_features": int(len(CAT_FEATURE_INDICES)),
             "artifacts_dir": str(ART_DIR),
+            "model_file": str(SCHEMA.get("model_file")),
+            "vocab_len": int(len(VOCAB)),
         },
     })
 
@@ -296,6 +309,8 @@ def health():
         "n_cat_features": len(CAT_FEATURE_INDICES),
         "has_ml_features": any(f.startswith(PREFIX) for f in FEATURES),
         "artifacts_dir": str(ART_DIR),
+        "model_file": str(SCHEMA.get("model_file")),
+        "vocab_len": int(len(VOCAB)),
     })
 
 @app.post("/predict")
