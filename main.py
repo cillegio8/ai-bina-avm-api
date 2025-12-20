@@ -18,7 +18,7 @@ import numpy as np
 # =========================================================
 # App
 # =========================================================
-MODEL_VERSION = os.getenv("MODEL_VERSION", "v2_multihot190")
+MODEL_VERSION = os.getenv("MODEL_VERSION", "v2_multihot187")
 app = FastAPI(title=f"AI-Bina AVM API ({MODEL_VERSION})")
 
 # =========================================================
