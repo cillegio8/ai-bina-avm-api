@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# Install system deps + curl (needed to download model)
+# System deps + curl (for GitHub Releases download)
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy requirements and install
+# Install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -16,13 +16,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
 # -----------------------------
-# Download model from GitHub Release
+# Download artifacts from GitHub Release
 # -----------------------------
-ARG MODEL_URL="https://github.com/cillegio8/ai-bina-avm-api/releases/download/v0.1.0/ai_bina_catboost_avm.cbm"
+ARG MODEL_VERSION="v2_multihot2000"
+ARG BASE_URL="https://github.com/cillegio8/ai-bina-avm-api/releases/download/${MODEL_VERSION}"
 
-RUN echo "Downloading model from: $MODEL_URL" \
- && curl -L --fail "$MODEL_URL" -o /app/ai_bina_catboost_avm.cbm \
- && ls -lh /app/ai_bina_catboost_avm.cbm
+RUN set -eux; \
+    mkdir -p /app/artifacts/${MODEL_VERSION}; \
+    echo "Downloading artifacts from: ${BASE_URL}"; \
+    curl -L --fail "${BASE_URL}/avm_catboost_multihot2000.cbm" -o "/app/artifacts/${MODEL_VERSION}/avm_catboost_multihot2000.cbm"; \
+    curl -L --fail "${BASE_URL}/training_schema.json"         -o "/app/artifacts/${MODEL_VERSION}/training_schema.json"; \
+    curl -L --fail "${BASE_URL}/microlocation_vocab.json"     -o "/app/artifacts/${MODEL_VERSION}/microlocation_vocab.json"; \
+    (curl -L --fail "${BASE_URL}/metrics.json" -o "/app/artifacts/${MODEL_VERSION}/metrics.json" || true); \
+    ls -lah "/app/artifacts/${MODEL_VERSION}"
 
 # Expose port
 EXPOSE 8080
